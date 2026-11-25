@@ -57,25 +57,6 @@ Stockfish (ARM64) кладётся в `bin/stockfish`; CI собирает ег�
 Если A и B перепутаны — поставь `nintendo_layout=0` в `saves/input.cfg` (пример: `input.cfg.example`).
 Для диагностики создай пустой файл `saves/input_debug`, понажимай кнопки и посмотри `saves/input.log`.
 
-## Сборка ARM64
-
-Проще всего через GitHub Actions (`.github/workflows/build.yml`, нативный ARM64-раннер).
-Локально на ARM64 Linux с libsdl2-dev:
-
-```sh
-cmake -S . -B build-rg35xx -DCMAKE_BUILD_TYPE=Release
-cmake --build build-rg35xx -j4
-./scripts/package.sh build-rg35xx
-```
-
-## Тесты правил
-
-```sh
-cmake -S . -B build-tests -DCHESSFORGE_BUILD_TESTS=ON
-cmake --build build-tests
-./build-tests/chess_rules_tests
-```
-
 ## Совместимость
 
 Проверялось на Anbernic RG35XX Plus с MustardOS 2606.0 Andromeda. На других устройствах и прошивках не тестировалось.
