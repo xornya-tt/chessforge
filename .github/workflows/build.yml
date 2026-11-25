@@ -7,14 +7,11 @@ jobs:
   build:
     # Native ARM64 runner inside Debian bullseye keeps glibc old enough for the console.
     runs-on: ubuntu-24.04-arm
-    container: debian:bullseye
+    container: debian:bookworm
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
-        run: |
-          echo 'deb http://archive.debian.org/debian bullseye main' > /etc/apt/sources.list
-          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
-          apt-get update && apt-get install -y g++ cmake pkg-config libsdl2-dev zip git make wget ca-certificates
+        run: apt-get update && apt-get install -y g++ cmake pkg-config libsdl2-dev zip git make wget ca-certificates
       - name: Rules tests
         run: |
           cmake -S . -B build-tests -DCHESSFORGE_BUILD_TESTS=ON
