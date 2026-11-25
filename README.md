@@ -75,3 +75,13 @@ cmake -S . -B build-tests -DCHESSFORGE_BUILD_TESTS=ON
 cmake --build build-tests
 ./build-tests/chess_rules_tests
 ```
+
+## Совместимость
+
+Проверялось на Anbernic RG35XX Plus с MustardOS 2606.0 Andromeda. На других устройствах и прошивках не тестировалось.
+
+## Credits
+
+- Шахматный движок: [Stockfish](https://github.com/official-stockfish/Stockfish) (GPLv3). Если в пакет попал `bin/stockfish`, он запускается как отдельная программа; его исходники и лицензия по ссылке.
+- Графика и ввод: [SDL2](https://www.libsdl.org/) (zlib license).
+- Код ChessForge 3D распространяется по лицензии MIT, см. `LICENSE`.
