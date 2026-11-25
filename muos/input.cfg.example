@@ -1,0 +1,15 @@
+# Copy to saves/input.cfg if buttons feel swapped or do nothing.
+# nintendo_layout=1: physical A confirms, B cancels (SDL names are swapped).
+nintendo_layout=1
+# Raw joystick indices, used only if SDL has no controller mapping.
+# To find them: create an empty file saves/input_debug, press buttons,
+# then read saves/input.log.
+btn_a=0
+btn_b=1
+btn_x=2
+btn_y=3
+btn_l=4
+btn_r=5
+btn_select=8
+btn_start=9
+btn_menu=10
