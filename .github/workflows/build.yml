@@ -33,6 +33,17 @@ jobs:
           make -j4 net
           make -j4 build ARCH=armv8 COMP=gcc
           cp stockfish /tmp/stockfish
+      - name: Fetch Lichess piece set (optional)
+        continue-on-error: true
+        run: |
+          apt-get install -y librsvg2-bin imagemagick
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/lichess-org/lila.git /tmp/lila
+          cd /tmp/lila && git sparse-checkout set public/piece/cburnett
+          mkdir -p "$GITHUB_WORKSPACE/pieces/cburnett"
+          for p in wP wN wB wR wQ wK bP bN bB bR bQ bK; do
+            rsvg-convert -w 96 -h 96 "public/piece/cburnett/$p.svg" -o "/tmp/$p.png"
+            convert "/tmp/$p.png" -define bmp:format=bmp4 "$GITHUB_WORKSPACE/pieces/cburnett/$p.bmp"
+          done
       - name: Package
         run: sh scripts/package.sh build-rg35xx $(test -f /tmp/stockfish && echo /tmp/stockfish)
       - uses: actions/upload-artifact@v4

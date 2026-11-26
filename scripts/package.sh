@@ -16,6 +16,7 @@ cp "$ROOT/muos/glyph/icon.png" "$STAGE/glyph/icon.png"
 cp "$ROOT/muos/input.cfg.example" "$STAGE/input.cfg.example"
 cp "$ROOT/themes/neon-carbon.cfg" "$STAGE/neon-carbon.cfg.example"
 [ -n "$STOCKFISH" ] && [ -f "$STOCKFISH" ] && cp "$STOCKFISH" "$STAGE/bin/stockfish"
+[ -d "$ROOT/pieces" ] && cp -r "$ROOT/pieces" "$STAGE/pieces"
 chmod +x "$STAGE/mux_launch.sh" "$STAGE/bin/"*
 
 (cd "$STAGE" && find . -type f ! -name manifest.sha256 | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do sha256sum "$f"; done > manifest.sha256)

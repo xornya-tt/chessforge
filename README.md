@@ -85,3 +85,10 @@ cmake --build build-tests
 - Шахматный движок: [Stockfish](https://github.com/official-stockfish/Stockfish) (GPLv3). Если в пакет попал `bin/stockfish`, он запускается как отдельная программа; его исходники и лицензия по ссылке.
 - Графика и ввод: [SDL2](https://www.libsdl.org/) (zlib license).
 - Код ChessForge 3D распространяется по лицензии MIT, см. `LICENSE`.
+
+## Наборы фигур
+
+В игре: **Y → PIECES** (влево/вправо) переключает набор. «BUILT-IN» это встроенные векторные фигуры.
+Свои наборы кладутся в `pieces/<имя>/` (файлы `wP.bmp … bK.bmp`, подробности в `pieces/README.md`).
+Релизная сборка включает набор `cburnett` с lichess (автор Colin M.L. Burnett; лицензию проверяйте в репозитории
+[lila](https://github.com/lichess-org/lila/tree/master/public/piece)).

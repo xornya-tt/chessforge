@@ -15,6 +15,7 @@
 #include <sstream>
 #include <utility>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -25,6 +26,7 @@ constexpr int BoardLeft = 16;
 constexpr int BoardTop = 36;
 constexpr int SquareSize = 52;
 constexpr int BoardPixels = SquareSize * 8;
+constexpr float Pi = 3.14159265358979F;
 
 using chessforge::Board;
 using chessforge::Color;
@@ -59,8 +61,9 @@ struct Settings {
     bool threeDimensional = true;
     int elo = 1200;
     bool playerWhite = true;
-    float yaw = 0.62F;
-    float pitch = 0.66F;
+    float yaw = 0.0F;
+    float pitch = 0.85F;
+    std::string pieceSet;  // empty = built-in vector pieces, otherwise folder name inside pieces/
     SDL_Color customLight{224, 202, 164, 255};
     SDL_Color customDark{126, 88, 61, 255};
     SDL_Color customAccent{65, 185, 161, 255};
@@ -72,6 +75,7 @@ struct Settings {
         std::string value;
         while (std::getline(input, key, '=') && std::getline(input, value)) {
             try {
+                if (key == "piece_set") { pieceSet = value; while (!pieceSet.empty() && (pieceSet.back() == '\r' || pieceSet.back() == ' ')) pieceSet.pop_back(); }
                 if (key == "theme") theme = std::clamp(std::stoi(value), 0, 4);
                 if (key == "texture") texture = std::clamp(std::stoi(value), 0, 4);
                 if (key == "three_dimensional") threeDimensional = value == "1";
@@ -100,6 +104,7 @@ struct Settings {
         std::filesystem::create_directories("saves");
         std::ofstream output("saves/settings.cfg", std::ios::trunc);
         output << "theme=" << theme << '\n';
+        output << "piece_set=" << pieceSet << '\n';
         output << "texture=" << texture << '\n';
         output << "three_dimensional=" << (threeDimensional ? 1 : 0) << '\n';
         output << "elo=" << elo << '\n';
@@ -194,10 +199,160 @@ SDL_Color brighten(SDL_Color value, int amount) {
     return {static_cast<Uint8>(std::clamp(static_cast<int>(value.r) + amount, 0, 255)), static_cast<Uint8>(std::clamp(static_cast<int>(value.g) + amount, 0, 255)), static_cast<Uint8>(std::clamp(static_cast<int>(value.b) + amount, 0, 255)), value.a};
 }
 
+
+// Tiny software canvas used to draw the built-in piece icons into an SDL surface.
+class PieceCanvas {
+public:
+    explicit PieceCanvas(int size) : size_(size), surface_(SDL_CreateRGBSurfaceWithFormat(0, size, size, 32, SDL_PIXELFORMAT_RGBA32)) {
+        if (surface_ != nullptr) SDL_FillRect(surface_, nullptr, 0);
+    }
+    ~PieceCanvas() { if (surface_ != nullptr) SDL_FreeSurface(surface_); }
+    PieceCanvas(const PieceCanvas&) = delete;
+    PieceCanvas& operator=(const PieceCanvas&) = delete;
+
+    SDL_Surface* surface() const { return surface_; }
+    SDL_Surface* release() { SDL_Surface* result = surface_; surface_ = nullptr; return result; }
+
+    void color(SDL_Color value) { pixel_ = surface_ != nullptr ? SDL_MapRGBA(surface_->format, value.r, value.g, value.b, 255) : 0; }
+
+    void span(int y, int x1, int x2) {
+        if (surface_ == nullptr || y < 0 || y >= size_) return;
+        x1 = std::max(x1, 0);
+        x2 = std::min(x2, size_ - 1);
+        auto* row = reinterpret_cast<Uint32*>(static_cast<Uint8*>(surface_->pixels) + y * surface_->pitch);
+        for (int x = x1; x <= x2; ++x) row[x] = pixel_;
+    }
+
+    void rect(int x, int y, int w, int h) { for (int row = y; row < y + h; ++row) span(row, x, x + w - 1); }
+
+    void circle(int cx, int cy, int r) {
+        for (int dy = -r; dy <= r; ++dy) {
+            const int dx = static_cast<int>(std::lround(std::sqrt(static_cast<float>(r * r - dy * dy))));
+            span(cy + dy, cx - dx, cx + dx);
+        }
+    }
+
+    void triangle(SDL_Point a, SDL_Point b, SDL_Point c) {
+        const std::array<SDL_Point, 3> p{{a, b, c}};
+        const int top = std::min({a.y, b.y, c.y});
+        const int bottom = std::max({a.y, b.y, c.y});
+        for (int y = top; y <= bottom; ++y) {
+            float lo = 1e9F;
+            float hi = -1e9F;
+            for (std::size_t i = 0; i < 3; ++i) {
+                const SDL_Point& from = p[i];
+                const SDL_Point& to = p[(i + 1) % 3];
+                if (from.y == to.y) {
+                    if (from.y == y) { lo = std::min(lo, static_cast<float>(std::min(from.x, to.x))); hi = std::max(hi, static_cast<float>(std::max(from.x, to.x))); }
+                    continue;
+                }
+                if (y < std::min(from.y, to.y) || y > std::max(from.y, to.y)) continue;
+                const float x = static_cast<float>(from.x) + static_cast<float>(y - from.y) * static_cast<float>(to.x - from.x) / static_cast<float>(to.y - from.y);
+                lo = std::min(lo, x);
+                hi = std::max(hi, x);
+            }
+            if (hi >= lo) span(y, static_cast<int>(std::floor(lo)), static_cast<int>(std::ceil(hi)));
+        }
+    }
+
+    void quad(SDL_Point a, SDL_Point b, SDL_Point c, SDL_Point d) { triangle(a, b, c); triangle(a, c, d); }
+
+    void fan(const std::vector<SDL_Point>& points, SDL_Point center) {
+        for (std::size_t i = 0; i < points.size(); ++i) triangle(center, points[i], points[(i + 1) % points.size()]);
+    }
+
+    void line(int x1, int y1, int x2, int y2, int radius) {
+        const int steps = std::max(std::abs(x2 - x1), std::abs(y2 - y1));
+        for (int step = 0; step <= steps; ++step) {
+            const float t = steps == 0 ? 0.0F : static_cast<float>(step) / static_cast<float>(steps);
+            circle(x1 + static_cast<int>(std::lround(t * static_cast<float>(x2 - x1))), y1 + static_cast<int>(std::lround(t * static_cast<float>(y2 - y1))), radius);
+        }
+    }
+
+private:
+    int size_;
+    SDL_Surface* surface_;
+    Uint32 pixel_ = 0;
+};
+
+// Draws the silhouette of one piece type (96x96 design grid), shifted by (ox, oy).
+void drawPieceShape(PieceCanvas& c, PieceType type, int ox, int oy) {
+    const auto P = [&](int x, int y) { return SDL_Point{x + ox, y + oy}; };
+    const auto R = [&](int x, int y, int w, int h) { c.rect(x + ox, y + oy, w, h); };
+    const auto C = [&](int x, int y, int r) { c.circle(x + ox, y + oy, r); };
+    const auto Q = [&](int x1, int y1, int x2, int y2, int x3, int y3, int x4, int y4) { c.quad(P(x1, y1), P(x2, y2), P(x3, y3), P(x4, y4)); };
+    const auto T = [&](int x1, int y1, int x2, int y2, int x3, int y3) { c.triangle(P(x1, y1), P(x2, y2), P(x3, y3)); };
+
+    R(22, 78, 52, 9);
+    R(28, 72, 40, 8);
+    switch (type) {
+        case PieceType::Pawn:
+            C(48, 26, 12);
+            Q(40, 34, 56, 34, 62, 50, 34, 50);
+            Q(34, 48, 62, 48, 68, 74, 28, 74);
+            break;
+        case PieceType::Rook:
+            R(26, 12, 12, 16); R(42, 12, 12, 16); R(58, 12, 12, 16);
+            R(26, 24, 44, 8);
+            Q(32, 30, 64, 30, 62, 66, 34, 66);
+            Q(30, 64, 66, 64, 70, 74, 26, 74);
+            break;
+        case PieceType::Bishop:
+            C(48, 12, 5);
+            C(48, 30, 14);
+            Q(38, 38, 58, 38, 66, 74, 30, 74);
+            R(32, 52, 32, 7);
+            break;
+        case PieceType::Knight: {
+            const std::vector<SDL_Point> shape{P(28, 76), P(36, 54), P(24, 46), P(22, 40), P(34, 22), P(38, 12), P(46, 18), P(60, 24), P(70, 46), P(68, 76)};
+            c.fan(shape, P(50, 52));
+            break;
+        }
+        case PieceType::Queen:
+            Q(38, 38, 58, 38, 66, 74, 30, 74);
+            T(24, 14, 28, 36, 40, 36); T(48, 10, 36, 36, 60, 36); T(72, 14, 56, 36, 68, 36);
+            R(28, 34, 40, 8);
+            C(24, 12, 4); C(48, 8, 4); C(72, 12, 4);
+            break;
+        case PieceType::King:
+            Q(36, 34, 60, 34, 66, 74, 30, 74);
+            C(48, 38, 14);
+            R(44, 4, 8, 28);
+            R(35, 12, 26, 8);
+            break;
+        case PieceType::None: break;
+    }
+}
+
+void drawPieceDetails(PieceCanvas& c, PieceType type) {
+    switch (type) {
+        case PieceType::Bishop: c.line(47, 22, 55, 34, 1); break;
+        case PieceType::Knight: c.circle(38, 28, 2); break;
+        case PieceType::Queen: c.rect(34, 58, 28, 2); break;
+        case PieceType::King: c.rect(36, 58, 24, 2); break;
+        case PieceType::Rook: c.rect(34, 40, 28, 2); break;
+        default: break;
+    }
+}
+
+SDL_Surface* renderBuiltinPiece(PieceType type, SDL_Color fill, SDL_Color edge) {
+    PieceCanvas canvas(96);
+    if (canvas.surface() == nullptr) return nullptr;
+    canvas.color(edge);
+    constexpr std::array<std::array<int, 2>, 8> offsets{{{{-3, 0}}, {{3, 0}}, {{0, -3}}, {{0, 3}}, {{-2, -2}}, {{2, -2}}, {{-2, 2}}, {{2, 2}}}};
+    for (const auto& offset : offsets) drawPieceShape(canvas, type, offset[0], offset[1]);
+    canvas.color(fill);
+    drawPieceShape(canvas, type, 0, 0);
+    canvas.color(edge);
+    drawPieceDetails(canvas, type);
+    return canvas.release();
+}
+
 struct Vec3 { float x; float y; float z; };
 
 class ChessApp {
 public:
+    ~ChessApp() { destroyPieceTextures(); }
     explicit ChessApp(SDL_Renderer* renderer)
         : renderer_(renderer), computer_(std::filesystem::path("bin") / "stockfish") {
         settings_.load();
@@ -233,6 +388,7 @@ public:
 
     void draw() {
         const Theme palette = currentTheme();
+        ensurePieceTextures(palette);
         fill(renderer_, {0, 0, ScreenWidth, ScreenHeight}, palette.background);
         if (settings_.threeDimensional) drawBoard3D(palette);
         else drawBoard2D(palette);
@@ -256,6 +412,15 @@ private:
     int colorChannel_ = 0;
     bool running_ = true;
     std::string notice_;
+    std::array<SDL_Texture*, 12> pieceTextures_{};
+    bool piecesBuilt_ = false;
+    std::string builtSet_;
+    SDL_Color builtWhite_{};
+    SDL_Color builtBlack_{};
+    float camScale_ = 100.0F;
+    float camCx_ = 226.0F;
+    float camCy_ = 251.0F;
+    static constexpr float CameraDistance = 13.0F;
 
     [[nodiscard]] Color playerColor() const { return settings_.playerWhite ? Color::White : Color::Black; }
     [[nodiscard]] bool gameOver() const { return board_.gameState() != GameState::Playing; }
@@ -298,8 +463,18 @@ private:
     }
 
     void moveCursor(int visualX, int visualY) {
-        const int fileDirection = flipped() ? -visualX : visualX;
-        const int rankDirection = flipped() ? visualY : -visualY;
+        int fileDirection = flipped() ? -visualX : visualX;
+        int rankDirection = flipped() ? visualY : -visualY;
+        if (settings_.threeDimensional) {
+            const int quarter = ((static_cast<int>(std::lround(effectiveYaw() / (Pi / 2.0F))) % 4) + 4) % 4;
+            constexpr std::array<int, 4> cosines{{1, 0, -1, 0}};
+            constexpr std::array<int, 4> sines{{0, 1, 0, -1}};
+            const int cosine = cosines[static_cast<std::size_t>(quarter)];
+            const int sine = sines[static_cast<std::size_t>(quarter)];
+            const int up = -visualY;
+            fileDirection = visualX * cosine + up * sine;
+            rankDirection = -visualX * sine + up * cosine;
+        }
         const int file = std::clamp(Board::fileOf(cursor_) + fileDirection, 0, 7);
         const int rank = std::clamp(Board::rankOf(cursor_) + rankDirection, 0, 7);
         cursor_ = Board::square(file, rank);
@@ -387,8 +562,8 @@ private:
             return;
         }
         if (key == SDLK_SPACE || key == SDLK_a || key == SDLK_RETURN) {
-            if (settingIndex_ >= 5) {
-                colorEdit_ = settingIndex_ - 5;
+            if (settingIndex_ >= 6) {
+                colorEdit_ = settingIndex_ - 6;
                 colorChannel_ = 0;
                 return;
             }
@@ -397,8 +572,8 @@ private:
             return;
         }
         if (key == SDLK_b) { settingsOpen_ = false; settings_.save(); return; }
-        if (key == SDLK_UP) settingIndex_ = (settingIndex_ + 8) % 9;
-        else if (key == SDLK_DOWN) settingIndex_ = (settingIndex_ + 1) % 9;
+        if (key == SDLK_UP) settingIndex_ = (settingIndex_ + 9) % 10;
+        else if (key == SDLK_DOWN) settingIndex_ = (settingIndex_ + 1) % 10;
         else if (key == SDLK_LEFT || key == SDLK_RIGHT) {
             const int direction = key == SDLK_LEFT ? -1 : 1;
             if (settingIndex_ == 0) settings_.theme = (settings_.theme + direction + 5) % 5;
@@ -406,6 +581,13 @@ private:
             if (settingIndex_ == 2) settings_.elo = std::clamp(settings_.elo + direction * 100, 400, 3200);
             if (settingIndex_ == 3) settings_.playerWhite = !settings_.playerWhite;
             if (settingIndex_ == 4) settings_.pitch = std::clamp(settings_.pitch + static_cast<float>(direction) * 0.05F, 0.30F, 1.10F);
+            if (settingIndex_ == 5) {
+                const std::vector<std::string> sets = pieceSets();
+                std::size_t current = 0;
+                for (std::size_t index = 0; index < sets.size(); ++index) if (sets[index] == settings_.pieceSet) current = index;
+                const int count = static_cast<int>(sets.size());
+                settings_.pieceSet = sets[static_cast<std::size_t>((static_cast<int>(current) + direction + count) % count)];
+            }
             settings_.save();
         }
     }
@@ -461,13 +643,77 @@ private:
         }
     }
 
-    void drawPiece2D(int square, Piece piece, const Theme& palette) {
+    static bool sameColor(SDL_Color a, SDL_Color b) { return a.r == b.r && a.g == b.g && a.b == b.b; }
+
+    static std::size_t pieceIndex(Piece piece) {
+        return (piece.color == Color::White ? 0U : 6U) + static_cast<std::size_t>(static_cast<int>(piece.type) - 1);
+    }
+
+    [[nodiscard]] std::vector<std::string> pieceSets() const {
+        std::vector<std::string> sets{std::string()};
+        std::error_code error;
+        for (const auto& entry : std::filesystem::directory_iterator("pieces", error)) {
+            if (entry.is_directory(error)) sets.push_back(entry.path().filename().string());
+        }
+        std::sort(sets.begin() + 1, sets.end());
+        return sets;
+    }
+
+    void destroyPieceTextures() {
+        for (SDL_Texture*& texture : pieceTextures_) {
+            if (texture != nullptr) SDL_DestroyTexture(texture);
+            texture = nullptr;
+        }
+        piecesBuilt_ = false;
+    }
+
+    SDL_Texture* loadCustomPiece(const std::string& set, bool white, std::size_t type) const {
+        const std::string path = "pieces/" + set + "/" + (white ? 'w' : 'b') + "PNBRQK"[type] + ".bmp";
+        SDL_Surface* loaded = SDL_LoadBMP(path.c_str());
+        if (loaded == nullptr) return nullptr;
+        if (!SDL_ISPIXELFORMAT_ALPHA(loaded->format->format)) SDL_SetColorKey(loaded, SDL_TRUE, SDL_MapRGB(loaded->format, 255, 0, 255));
+        SDL_Surface* converted = SDL_ConvertSurfaceFormat(loaded, SDL_PIXELFORMAT_RGBA32, 0);
+        SDL_FreeSurface(loaded);
+        if (converted == nullptr) return nullptr;
+        SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer_, converted);
+        SDL_FreeSurface(converted);
+        if (texture != nullptr) SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+        return texture;
+    }
+
+    void ensurePieceTextures(const Theme& palette) {
+        if (piecesBuilt_ && builtSet_ == settings_.pieceSet && sameColor(builtWhite_, palette.whitePiece) && sameColor(builtBlack_, palette.blackPiece)) return;
+        destroyPieceTextures();
+        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+        constexpr SDL_Color DarkEdge{22, 22, 28, 255};
+        constexpr SDL_Color LightEdge{238, 238, 244, 255};
+        constexpr std::array<PieceType, 6> types{{PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen, PieceType::King}};
+        for (std::size_t color = 0; color < 2; ++color) {
+            for (std::size_t type = 0; type < 6; ++type) {
+                SDL_Texture* texture = settings_.pieceSet.empty() ? nullptr : loadCustomPiece(settings_.pieceSet, color == 0, type);
+                if (texture == nullptr) {
+                    SDL_Surface* art = renderBuiltinPiece(types[type], color == 0 ? palette.whitePiece : palette.blackPiece, color == 0 ? DarkEdge : LightEdge);
+                    if (art != nullptr) {
+                        texture = SDL_CreateTextureFromSurface(renderer_, art);
+                        SDL_FreeSurface(art);
+                        if (texture != nullptr) SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+                    }
+                }
+                pieceTextures_[color * 6 + type] = texture;
+            }
+        }
+        builtSet_ = settings_.pieceSet;
+        builtWhite_ = palette.whitePiece;
+        builtBlack_ = palette.blackPiece;
+        piecesBuilt_ = true;
+    }
+
+    void drawPiece2D(int square, Piece piece, const Theme&) {
         const SDL_Rect cell = squareRect(square);
-        const std::string label(1, chessforge::pieceGlyph(piece));
-        const int scale = 5;
-        const SDL_Color shadow = darken(piece.color == Color::White ? palette.whitePiece : palette.blackPiece, 80);
-        drawText(renderer_, cell.x + (cell.w - textWidth(label, scale)) / 2 + 2, cell.y + 10 + 2, label, scale, shadow);
-        drawText(renderer_, cell.x + (cell.w - textWidth(label, scale)) / 2, cell.y + 10, label, scale, piece.color == Color::White ? palette.whitePiece : palette.blackPiece);
+        SDL_Texture* texture = pieceTextures_[pieceIndex(piece)];
+        if (texture == nullptr) return;
+        const SDL_Rect target{cell.x + 3, cell.y + 3, cell.w - 6, cell.h - 6};
+        SDL_RenderCopy(renderer_, texture, nullptr, &target);
     }
 
     void drawBoard2D(const Theme& palette) {
@@ -493,17 +739,55 @@ private:
         drawText(renderer_, BoardLeft + BoardPixels + 6, BoardTop + BoardPixels - 9, "1 2 3 4 5 6 7 8", 1, palette.text);
     }
 
-    SDL_Point project(Vec3 point) const {
-        const float cosineYaw = std::cos(settings_.yaw);
-        const float sineYaw = std::sin(settings_.yaw);
+    [[nodiscard]] float effectiveYaw() const { return settings_.yaw + (flipped() ? Pi : 0.0F); }
+
+    // World -> camera space: x right, y up, z = depth (larger is farther away).
+    [[nodiscard]] Vec3 toCamera(Vec3 point) const {
+        const float yaw = effectiveYaw();
+        const float cosineYaw = std::cos(yaw);
+        const float sineYaw = std::sin(yaw);
         const float x1 = point.x * cosineYaw - point.z * sineYaw;
         const float z1 = point.x * sineYaw + point.z * cosineYaw;
         const float cosinePitch = std::cos(settings_.pitch);
         const float sinePitch = std::sin(settings_.pitch);
-        const float y2 = point.y * cosinePitch - z1 * sinePitch;
-        const float z2 = point.y * sinePitch + z1 * cosinePitch;
-        const float perspective = 405.0F / std::max(3.0F, 11.0F + z2);
-        return {static_cast<int>(240.0F + x1 * perspective), static_cast<int>(252.0F - y2 * perspective)};
+        return {x1, point.y * cosinePitch + z1 * sinePitch, z1 * cosinePitch - point.y * sinePitch};
+    }
+
+    // Fits the whole board (with pieces) into the area left of the sidebar for any yaw/pitch.
+    void updateCamera() {
+        float minX = 1e9F;
+        float maxX = -1e9F;
+        float minY = 1e9F;
+        float maxY = -1e9F;
+        for (const float x : {-4.15F, 4.15F}) {
+            for (const float z : {-4.15F, 4.15F}) {
+                for (const float y : {0.0F, 1.25F}) {
+                    const Vec3 c = toCamera({x, y, z});
+                    const float inverse = 1.0F / std::max(3.0F, CameraDistance + c.z);
+                    minX = std::min(minX, c.x * inverse);
+                    maxX = std::max(maxX, c.x * inverse);
+                    minY = std::min(minY, -c.y * inverse);
+                    maxY = std::max(maxY, -c.y * inverse);
+                }
+            }
+        }
+        camScale_ = std::min(430.0F / (maxX - minX), 420.0F / (maxY - minY));
+        camCx_ = 226.0F - (minX + maxX) * 0.5F * camScale_;
+        camCy_ = 256.0F - (minY + maxY) * 0.5F * camScale_;
+    }
+
+    SDL_Point project(Vec3 point) const {
+        const Vec3 c = toCamera(point);
+        const float perspective = camScale_ / std::max(3.0F, CameraDistance + c.z);
+        return {static_cast<int>(std::lround(camCx_ + c.x * perspective)), static_cast<int>(std::lround(camCy_ - c.y * perspective))};
+    }
+
+    [[nodiscard]] bool faceVisible(Vec3 center, Vec3 normal) const {
+        const Vec3 origin = toCamera({0.0F, 0.0F, 0.0F});
+        const Vec3 rotated = toCamera(normal);
+        const Vec3 n{rotated.x - origin.x, rotated.y - origin.y, rotated.z - origin.z};
+        const Vec3 c = toCamera(center);
+        return n.x * c.x + n.y * c.y + n.z * (c.z + CameraDistance) < 0.0F;
     }
 
     void fillTriangle(SDL_Point first, SDL_Point second, SDL_Point third, SDL_Color color) {
@@ -566,6 +850,7 @@ private:
     void drawBox(float centerX, float centerZ, float bottom, float height, float width, SDL_Color color) {
         const float half = width / 2.0F;
         const float top = bottom + height;
+        const float middle = bottom + height / 2.0F;
         const Vec3 a{centerX - half, bottom, centerZ - half};
         const Vec3 b{centerX + half, bottom, centerZ - half};
         const Vec3 c{centerX + half, bottom, centerZ + half};
@@ -574,11 +859,11 @@ private:
         const Vec3 f{centerX + half, top, centerZ - half};
         const Vec3 g{centerX + half, top, centerZ + half};
         const Vec3 h{centerX - half, top, centerZ + half};
-        fillQuad(a, b, f, e, darken(color, 25));
-        fillQuad(b, c, g, f, color);
-        fillQuad(c, d, h, g, brighten(color, 15));
-        fillQuad(d, a, e, h, darken(color, 45));
-        fillQuad(e, f, g, h, brighten(color, 20));
+        if (faceVisible({centerX, middle, centerZ - half}, {0.0F, 0.0F, -1.0F})) fillQuad(a, b, f, e, darken(color, 25));
+        if (faceVisible({centerX + half, middle, centerZ}, {1.0F, 0.0F, 0.0F})) fillQuad(b, c, g, f, color);
+        if (faceVisible({centerX, middle, centerZ + half}, {0.0F, 0.0F, 1.0F})) fillQuad(c, d, h, g, brighten(color, 15));
+        if (faceVisible({centerX - half, middle, centerZ}, {-1.0F, 0.0F, 0.0F})) fillQuad(d, a, e, h, darken(color, 45));
+        if (faceVisible({centerX, top, centerZ}, {0.0F, 1.0F, 0.0F})) fillQuad(e, f, g, h, brighten(color, 20));
     }
 
     void drawPiece3D(int square, Piece piece, const Theme& palette) {
@@ -619,6 +904,7 @@ private:
     }
 
     void drawBoard3D(const Theme& palette) {
+        updateCamera();
         for (int rank = 0; rank < 8; ++rank) {
             for (int file = 0; file < 8; ++file) {
                 const SDL_Color base = ((file + rank) & 1) == 0 ? palette.darkSquare : palette.lightSquare;
@@ -629,13 +915,19 @@ private:
                 drawTexture3D(file, rank, color);
             }
         }
-        for (int square = 0; square < 64; ++square) {
-            const Piece piece = board_.at(square);
-            if (!piece.empty()) drawPiece3D(square, piece, palette);
-        }
         if (selected_ >= 0) drawOutline3D(selected_, palette.accent);
         drawOutline3D(cursor_, palette.highlight);
         for (int square = 0; square < 64; ++square) if (legalDestination(square)) drawOutline3D(square, palette.accent);
+
+        // Painter's algorithm: farthest pieces first.
+        std::vector<std::pair<float, int>> order;
+        for (int square = 0; square < 64; ++square) {
+            if (board_.at(square).empty()) continue;
+            const Vec3 centre{static_cast<float>(Board::fileOf(square)) - 3.5F, 0.3F, static_cast<float>(Board::rankOf(square)) - 3.5F};
+            order.emplace_back(toCamera(centre).z, square);
+        }
+        std::sort(order.begin(), order.end(), [](const auto& left, const auto& right) { return left.first > right.first; });
+        for (const auto& entry : order) drawPiece3D(entry.second, board_.at(entry.second), palette);
         drawText(renderer_, 16, 16, "3D BOARD", 2, palette.text);
     }
 
@@ -694,24 +986,26 @@ private:
             drawText(renderer_, 140, 336, "A SAVES", 1, palette.highlight);
             return;
         }
-        const std::array<std::string, 9> labels{{"THEME", "TEXTURE", "BOT ELO", "YOUR SIDE", "CAMERA", "LIGHT RGB", "DARK RGB", "ACCENT RGB", "BACK RGB"}};
+        const std::array<std::string, 10> labels{{"THEME", "TEXTURE", "BOT ELO", "YOUR SIDE", "CAMERA", "PIECES", "LIGHT RGB", "DARK RGB", "ACCENT RGB", "BACK RGB"}};
         const std::array<std::string, 5> themeNames{{"OAK", "VIOLET", "FOREST", "MONO", "CUSTOM"}};
         const std::array<std::string, 5> textureNames{{"FLAT", "WOOD", "MARBLE", "CARBON", "FELT"}};
         const auto rgb = [](SDL_Color color) { return std::to_string(color.r) + " " + std::to_string(color.g) + " " + std::to_string(color.b); };
-        const std::array<std::string, 9> values{{
+        const std::array<std::string, 10> values{{
             themeNames[static_cast<std::size_t>(settings_.theme)], textureNames[static_cast<std::size_t>(settings_.texture)],
             std::to_string(settings_.elo), settings_.playerWhite ? "WHITE" : "BLACK", std::to_string(static_cast<int>(settings_.pitch * 100.0F)),
+            settings_.pieceSet.empty() ? std::string("BUILT-IN") : settings_.pieceSet,
             rgb(settings_.customLight), rgb(settings_.customDark), rgb(settings_.customAccent), rgb(settings_.customBackground)
         }};
-        for (int index = 0; index < 9; ++index) {
-            const int y = 110 + index * 29;
+        for (int index = 0; index < 10; ++index) {
+            const int y = 104 + index * 28;
             if (index == settingIndex_) fill(renderer_, {68, y - 4, 504, 24}, palette.accent);
             drawText(renderer_, 82, y, labels[static_cast<std::size_t>(index)], 2, index == settingIndex_ ? palette.background : palette.text);
             const int valueX = 550 - textWidth(values[static_cast<std::size_t>(index)], 2);
             drawText(renderer_, valueX, y, values[static_cast<std::size_t>(index)], 2, index == settingIndex_ ? palette.background : palette.highlight);
         }
-        drawText(renderer_, 74, 382, "LEFT RIGHT CHANGE A EDITS RGB", 1, palette.text);
-        drawText(renderer_, 74, 402, "B CLOSES AND SAVES", 1, palette.highlight);
+        drawText(renderer_, 74, 392, "LEFT RIGHT CHANGE A EDITS RGB", 1, palette.text);
+        drawText(renderer_, 74, 410, "PIECE SETS: FOLDER PIECES/NAME", 1, palette.text);
+        drawText(renderer_, 74, 428, "B CLOSES AND SAVES", 1, palette.highlight);
     }
 
     void drawHelp(const Theme& palette) {
