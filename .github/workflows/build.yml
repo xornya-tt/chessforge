@@ -15,12 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
-        run: apt-get update && apt-get install -y g++ cmake pkg-config libsdl2-dev zip git make wget ca-certificates
-      - name: Rules tests
+        run: apt-get update && apt-get install -y g++ cmake pkg-config libsdl2-dev zip git make wget ca-certificates librsvg2-bin imagemagick
+      - name: Tests
         run: |
           cmake -S . -B build-tests -DCHESSFORGE_BUILD_TESTS=ON
           cmake --build build-tests -j4
           ./build-tests/chess_rules_tests
+          ./build-tests/ui_tests
       - name: Build game
         run: |
           cmake -S . -B build-rg35xx -DCMAKE_BUILD_TYPE=Release
@@ -36,23 +37,60 @@ jobs:
       - name: Fetch Lichess piece set (optional)
         continue-on-error: true
         run: |
-          apt-get install -y librsvg2-bin imagemagick
           git clone --depth 1 --filter=blob:none --sparse https://github.com/lichess-org/lila.git /tmp/lila
           cd /tmp/lila && git sparse-checkout set public/piece/cburnett
-          mkdir -p "$GITHUB_WORKSPACE/pieces/cburnett"
+          D="$GITHUB_WORKSPACE/pieces/cburnett"
+          mkdir -p "$D"
           for p in wP wN wB wR wQ wK bP bN bB bR bQ bK; do
             rsvg-convert -w 96 -h 96 "public/piece/cburnett/$p.svg" -o "/tmp/$p.png"
-            convert "/tmp/$p.png" -define bmp:format=bmp4 "$GITHUB_WORKSPACE/pieces/cburnett/$p.bmp"
+            convert "/tmp/$p.png" -define bmp:format=bmp4 "$D/$p.bmp"
           done
+          cat > "$D/LICENSE.txt" <<'LIC'
+          Piece set "cburnett" by Colin M.L. Burnett, taken from Lichess
+          (https://github.com/lichess-org/lila/tree/master/public/piece/cburnett).
+          Licence: GNU GPL version 2 or later, see COPYING-GPL-2.0.txt (as listed in lila's COPYING.md).
+          The SVG images were converted to 96x96 BMP files without other changes.
+          LIC
+          wget -q -O "$D/COPYING-GPL-2.0.txt" https://www.gnu.org/licenses/gpl-2.0.txt || true
       - name: Package
-        run: sh scripts/package.sh build-rg35xx $(test -f /tmp/stockfish && echo /tmp/stockfish)
+        run: |
+          STOCKFISH=""
+          if [ -f /tmp/stockfish ]; then STOCKFISH=/tmp/stockfish; fi
+          export STOCKFISH_COPYING="$PWD/Stockfish/Copying.txt"
+          sh scripts/package.sh build-rg35xx "$STOCKFISH"
+          cd out && sha256sum ChessForge3D-manual.zip ChessForge3D.muxapp > SHA256SUMS.txt
+      - name: Release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v v="$VERSION" '/^## /{p=($2==v); next} p' CHANGELOG.md > out/notes.md
+          cat >> out/notes.md <<'NOTES'
+
+          ## Install (MustardOS / muOS, tested on Anbernic RG35XX Plus, 2606.0 Andromeda)
+
+          1. Download `ChessForge3D-manual.zip` and unzip it into the **root of the SD card**
+             (result: `MUOS/application/ChessForge3D/mux_launch.sh`). Eject the card safely.
+          2. Reboot, then open Applications, ChessForge 3D.
+
+          `ChessForge3D.muxapp` is for Archive Manager and is experimental: 2606.0 may refuse it ("Archive blocked").
+          Check downloads with `SHA256SUMS.txt`.
+
+          Included: Stockfish (GPLv3, source https://github.com/official-stockfish/Stockfish/tree/sf_17.1) and the
+          Lichess `cburnett` piece set (GPLv2+). See `licenses/THIRD_PARTY.md` inside the package.
+          NOTES
       - uses: actions/upload-artifact@v4
         with:
-          name: ChessForge3D.muxapp
-          path: out/ChessForge3D.muxapp
+          name: ChessForge3D
+          path: |
+            out/ChessForge3D-manual.zip
+            out/ChessForge3D.muxapp
+            out/SHA256SUMS.txt
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: out/ChessForge3D.muxapp
-          generate_release_notes: true
+          files: |
+            out/ChessForge3D-manual.zip
+            out/ChessForge3D.muxapp
+            out/SHA256SUMS.txt
+          body_path: out/notes.md

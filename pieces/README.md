@@ -16,4 +16,5 @@ Convert them, for example:
     rsvg-convert -w 96 -h 96 wP.svg -o wP.png
     convert wP.png -define bmp:format=bmp4 wP.bmp
 
-Every set has its own licence (see the lila repository). Keep the author credit when you share a set.
+Every set has its own licence (see COPYING.md in the lila repository); some are non-commercial or non-derivative.
+The `cburnett` set is GPLv2+. Check the licence and keep the author credit before you share a set.

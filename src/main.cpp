@@ -1,5 +1,9 @@
 #include "chess.hpp"
 #include "engine.hpp"
+#include "font.hpp"
+#include "i18n.hpp"
+#include "input_map.hpp"
+#include "pieces3d.hpp"
 
 #include <SDL2/SDL.h>
 
@@ -7,15 +11,18 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <optional>
 #include <sstream>
-#include <utility>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -28,13 +35,17 @@ constexpr int SquareSize = 52;
 constexpr int BoardPixels = SquareSize * 8;
 constexpr float Pi = 3.14159265358979F;
 
+using chessforge::Action;
 using chessforge::Board;
 using chessforge::Color;
 using chessforge::ComputerPlayer;
 using chessforge::GameState;
+using chessforge::InputMap;
 using chessforge::Move;
 using chessforge::Piece;
 using chessforge::PieceType;
+using chessforge::Str;
+using chessforge::tr;
 
 struct Theme {
     SDL_Color background;
@@ -55,6 +66,33 @@ constexpr std::array<Theme, 4> Themes{{
     {{25, 25, 27, 255}, {43, 43, 47, 255}, {196, 196, 196, 255}, {75, 75, 80, 255}, {240, 164, 58, 255}, {98, 184, 244, 255}, {250, 250, 250, 255}, {36, 36, 39, 255}, {246, 246, 246, 255}},
 }};
 
+// Board colours of the Lichess "Brown", "Blue", "Green" and "Purple" boards inside Lichess' dark site colours.
+// Theme numbers: 0-3 built-in, 4 = custom (editable), 5.. = Lichess boards.
+constexpr int CustomTheme = 4;
+constexpr std::array<Theme, 4> LichessThemes{{
+    {{22, 21, 18, 255}, {38, 36, 33, 255}, {240, 217, 181, 255}, {181, 136, 99, 255}, {98, 153, 36, 255}, {155, 199, 0, 255}, {250, 250, 250, 255}, {46, 46, 50, 255}, {210, 210, 205, 255}},
+    {{22, 21, 18, 255}, {38, 36, 33, 255}, {222, 227, 230, 255}, {140, 162, 173, 255}, {98, 153, 36, 255}, {155, 199, 0, 255}, {250, 250, 250, 255}, {46, 46, 50, 255}, {210, 210, 205, 255}},
+    {{22, 21, 18, 255}, {38, 36, 33, 255}, {255, 255, 221, 255}, {134, 166, 102, 255}, {98, 153, 36, 255}, {155, 199, 0, 255}, {250, 250, 250, 255}, {46, 46, 50, 255}, {210, 210, 205, 255}},
+    {{22, 21, 18, 255}, {38, 36, 33, 255}, {159, 144, 176, 255}, {125, 74, 141, 255}, {98, 153, 36, 255}, {155, 199, 0, 255}, {250, 250, 250, 255}, {46, 46, 50, 255}, {210, 210, 205, 255}},
+}};
+constexpr int ThemeCount = static_cast<int>(CustomTheme + 1 + LichessThemes.size());
+
+// First launch: pick the interface language from the system locale (LANG=ru_RU... -> Russian).
+int detectLanguage() {
+    for (const char* name : {"LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"}) {
+        const char* value = std::getenv(name);
+        if (value == nullptr || std::strlen(value) < 2) continue;
+        const int index = chessforge::languageFromCode(std::string(value, 2));
+        if (index >= 0) return index;
+    }
+    return 0;
+}
+
+std::string trimmed(std::string value) {
+    while (!value.empty() && (value.back() == '\r' || value.back() == ' ' || value.back() == '\n')) value.pop_back();
+    return value;
+}
+
 struct Settings {
     int theme = 0;
     int texture = 1;
@@ -63,7 +101,10 @@ struct Settings {
     bool playerWhite = true;
     float yaw = 0.0F;
     float pitch = 0.85F;
-    std::string pieceSet;  // empty = built-in vector pieces, otherwise folder name inside pieces/
+    int language = detectLanguage();
+    bool twoPlayer = false;   // two humans share the device
+    bool autoFlip = true;     // two-player: turn the board towards the side to move
+    std::string pieceSet;     // empty = built-in vector pieces, otherwise folder name inside pieces/
     SDL_Color customLight{224, 202, 164, 255};
     SDL_Color customDark{126, 88, 61, 255};
     SDL_Color customAccent{65, 185, 161, 255};
@@ -75,12 +116,18 @@ struct Settings {
         std::string value;
         while (std::getline(input, key, '=') && std::getline(input, value)) {
             try {
-                if (key == "piece_set") { pieceSet = value; while (!pieceSet.empty() && (pieceSet.back() == '\r' || pieceSet.back() == ' ')) pieceSet.pop_back(); }
-                if (key == "theme") theme = std::clamp(std::stoi(value), 0, 4);
+                if (key == "piece_set") pieceSet = trimmed(value);
+                if (key == "language") {
+                    const int index = chessforge::languageFromCode(trimmed(value));
+                    if (index >= 0) language = index;
+                }
+                if (key == "two_player") twoPlayer = trimmed(value) == "1";
+                if (key == "auto_flip") autoFlip = trimmed(value) == "1";
+                if (key == "theme") theme = std::clamp(std::stoi(value), 0, ThemeCount - 1);
                 if (key == "texture") texture = std::clamp(std::stoi(value), 0, 4);
-                if (key == "three_dimensional") threeDimensional = value == "1";
+                if (key == "three_dimensional") threeDimensional = trimmed(value) == "1";
                 if (key == "elo") elo = std::clamp(std::stoi(value), 400, 3200);
-                if (key == "player_white") playerWhite = value == "1";
+                if (key == "player_white") playerWhite = trimmed(value) == "1";
                 if (key == "yaw") yaw = std::clamp(std::stof(value), -3.14F, 3.14F);
                 if (key == "pitch") pitch = std::clamp(std::stof(value), 0.30F, 1.10F);
                 if (key == "custom_light_r") customLight.r = static_cast<Uint8>(std::clamp(std::stoi(value), 0, 255));
@@ -103,6 +150,9 @@ struct Settings {
     void save() const {
         std::filesystem::create_directories("saves");
         std::ofstream output("saves/settings.cfg", std::ios::trunc);
+        output << "language=" << chessforge::languageCode(language) << '\n';
+        output << "two_player=" << (twoPlayer ? 1 : 0) << '\n';
+        output << "auto_flip=" << (autoFlip ? 1 : 0) << '\n';
         output << "theme=" << theme << '\n';
         output << "piece_set=" << pieceSet << '\n';
         output << "texture=" << texture << '\n';
@@ -126,34 +176,6 @@ struct Settings {
     }
 };
 
-std::array<unsigned char, 7> fontRows(char raw) {
-    const char c = static_cast<char>(std::toupper(static_cast<unsigned char>(raw)));
-    switch (c) {
-        case 'A': return {14,17,17,31,17,17,17}; case 'B': return {30,17,17,30,17,17,30};
-        case 'C': return {15,16,16,16,16,16,15}; case 'D': return {30,17,17,17,17,17,30};
-        case 'E': return {31,16,16,30,16,16,31}; case 'F': return {31,16,16,30,16,16,16};
-        case 'G': return {15,16,16,23,17,17,14}; case 'H': return {17,17,17,31,17,17,17};
-        case 'I': return {31,4,4,4,4,4,31}; case 'J': return {7,2,2,2,18,18,12};
-        case 'K': return {17,18,20,24,20,18,17}; case 'L': return {16,16,16,16,16,16,31};
-        case 'M': return {17,27,21,17,17,17,17}; case 'N': return {17,25,21,19,17,17,17};
-        case 'O': return {14,17,17,17,17,17,14}; case 'P': return {30,17,17,30,16,16,16};
-        case 'Q': return {14,17,17,17,21,18,13}; case 'R': return {30,17,17,30,20,18,17};
-        case 'S': return {15,16,16,14,1,1,30}; case 'T': return {31,4,4,4,4,4,4};
-        case 'U': return {17,17,17,17,17,17,14}; case 'V': return {17,17,17,17,17,10,4};
-        case 'W': return {17,17,17,17,21,27,17}; case 'X': return {17,17,10,4,10,17,17};
-        case 'Y': return {17,17,10,4,4,4,4}; case 'Z': return {31,1,2,4,8,16,31};
-        case '0': return {14,17,19,21,25,17,14}; case '1': return {4,12,4,4,4,4,14};
-        case '2': return {14,17,1,2,4,8,31}; case '3': return {30,1,1,14,1,1,30};
-        case '4': return {2,6,10,18,31,2,2}; case '5': return {31,16,16,30,1,1,30};
-        case '6': return {14,16,16,30,17,17,14}; case '7': return {31,1,2,4,8,8,8};
-        case '8': return {14,17,17,14,17,17,14}; case '9': return {14,17,17,15,1,1,14};
-        case ':': return {0,4,4,0,4,4,0}; case '-': return {0,0,0,31,0,0,0};
-        case '/': return {1,2,2,4,8,8,16}; case '.': return {0,0,0,0,0,6,6};
-        case '+': return {0,4,4,31,4,4,0}; case ' ': return {0,0,0,0,0,0,0};
-        default: return {31,17,2,4,8,0,8};
-    }
-}
-
 void setColor(SDL_Renderer* renderer, SDL_Color color) {
     SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
 }
@@ -171,24 +193,48 @@ void outline(SDL_Renderer* renderer, SDL_Rect rect, SDL_Color color, int width =
     }
 }
 
+// Text is UTF-8; letters of the built-in 5x7 font cover Latin and Cyrillic.
+int textWidth(const std::string& text, int scale) {
+    return static_cast<int>(chessforge::decodeUtf8(text).size()) * 6 * scale;
+}
+
 void drawText(SDL_Renderer* renderer, int x, int y, const std::string& text, int scale, SDL_Color color) {
     setColor(renderer, color);
     int pen = x;
-    for (const char character : text) {
-        const auto rows = fontRows(character);
+    const auto dot = [&](int column, int row) {
+        SDL_Rect pixel{pen + column * scale, y + row * scale, scale, scale};
+        SDL_RenderFillRect(renderer, &pixel);
+    };
+    for (const char32_t character : chessforge::decodeUtf8(text)) {
+        chessforge::Glyph glyph;
+        if (!chessforge::glyphFor(character, glyph)) glyph.rows = {31, 17, 2, 4, 8, 0, 8};
         for (int row = 0; row < 7; ++row) {
             for (int column = 0; column < 5; ++column) {
-                if ((rows[static_cast<std::size_t>(row)] & (1 << (4 - column))) == 0) continue;
-                SDL_Rect pixel{pen + column * scale, y + row * scale, scale, scale};
-                SDL_RenderFillRect(renderer, &pixel);
+                if ((glyph.rows[static_cast<std::size_t>(row)] & (1 << (4 - column))) != 0) dot(column, row);
             }
         }
+        if (glyph.mark == 1) { dot(1, -2); dot(3, -2); dot(2, -1); }
+        if (glyph.mark == 2) { dot(1, -1); dot(3, -1); }
+        if (glyph.mark == 3) { dot(4, -1); dot(3, -1); }
         pen += 6 * scale;
     }
 }
 
-int textWidth(const std::string& text, int scale) {
-    return static_cast<int>(text.size()) * 6 * scale;
+// Largest scale (<= requested, >= 1) at which the text still fits into maxWidth pixels.
+int fitScale(const std::string& text, int scale, int maxWidth) {
+    while (scale > 1 && textWidth(text, scale) > maxWidth) --scale;
+    return scale;
+}
+
+void drawTextFit(SDL_Renderer* renderer, int x, int y, const std::string& text, int scale, int maxWidth, SDL_Color color) {
+    const int used = fitScale(text, scale, maxWidth);
+    // Keep small text vertically centred in the line reserved for the requested scale.
+    drawText(renderer, x, y + (scale - used) * 7 / 2, text, used, color);
+}
+
+void drawTextRight(SDL_Renderer* renderer, int right, int y, const std::string& text, int scale, int maxWidth, SDL_Color color) {
+    const int used = fitScale(text, scale, maxWidth);
+    drawText(renderer, right - textWidth(text, used), y + (scale - used) * 7 / 2, text, used, color);
 }
 
 SDL_Color darken(SDL_Color value, int amount) {
@@ -199,6 +245,62 @@ SDL_Color brighten(SDL_Color value, int amount) {
     return {static_cast<Uint8>(std::clamp(static_cast<int>(value.r) + amount, 0, 255)), static_cast<Uint8>(std::clamp(static_cast<int>(value.g) + amount, 0, 255)), static_cast<Uint8>(std::clamp(static_cast<int>(value.b) + amount, 0, 255)), value.a};
 }
 
+// ---------------------------------------------------------------------------
+// Colour contrast: the cursor must stay visible on every square colour of every theme.
+// ---------------------------------------------------------------------------
+double relativeLuminance(SDL_Color color) {
+    const auto linear = [](int channel) {
+        const double s = static_cast<double>(channel) / 255.0;
+        return s <= 0.03928 ? s / 12.92 : std::pow((s + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b);
+}
+
+// WCAG contrast ratio, 1 (identical) .. 21 (black on white).
+double contrastRatio(SDL_Color a, SDL_Color b) {
+    const double la = relativeLuminance(a);
+    const double lb = relativeLuminance(b);
+    return (std::max(la, lb) + 0.05) / (std::min(la, lb) + 0.05);
+}
+
+// "Redmean" colour distance, 0 .. ~765. Catches equal-brightness colours of different hue that the ratio accepts.
+double colorDistance(SDL_Color a, SDL_Color b) {
+    const double mean = (static_cast<double>(a.r) + static_cast<double>(b.r)) / 2.0;
+    const double dr = static_cast<double>(a.r) - static_cast<double>(b.r);
+    const double dg = static_cast<double>(a.g) - static_cast<double>(b.g);
+    const double db = static_cast<double>(a.b) - static_cast<double>(b.b);
+    return std::sqrt((2.0 + mean / 256.0) * dr * dr + 4.0 * dg * dg + (2.0 + (255.0 - mean) / 256.0) * db * db);
+}
+
+// Returns the first preferred colour that is clearly visible on `background` (and different from `avoid`);
+// otherwise the best colour of a fixed palette of bright, saturated markers.
+SDL_Color pickContrast(SDL_Color background, std::initializer_list<SDL_Color> preferred, std::optional<SDL_Color> avoid = std::nullopt) {
+    const auto acceptable = [&](SDL_Color candidate) {
+        if (avoid && colorDistance(candidate, *avoid) < 110.0) return false;
+        return contrastRatio(candidate, background) >= 3.0 && colorDistance(candidate, background) >= 150.0;
+    };
+    for (const SDL_Color& candidate : preferred) {
+        if (acceptable(candidate)) return candidate;
+    }
+    static const std::array<SDL_Color, 8> pool{{{255, 214, 10, 255}, {0, 229, 255, 255}, {255, 64, 190, 255}, {255, 138, 0, 255},
+                                                {130, 255, 60, 255}, {255, 255, 255, 255}, {15, 15, 20, 255}, {255, 60, 60, 255}}};
+    SDL_Color best = pool[0];
+    double bestScore = -1.0;
+    for (const SDL_Color& candidate : pool) {
+        if (avoid && colorDistance(candidate, *avoid) < 110.0) continue;
+        const double score = std::min(contrastRatio(candidate, background), 8.0) + colorDistance(candidate, background) / 200.0;
+        if (score > bestScore) {
+            bestScore = score;
+            best = candidate;
+        }
+    }
+    return best;
+}
+
+// Black or white, whichever separates better from `color` (used for the thin halo around cursor frames).
+SDL_Color haloFor(SDL_Color color) {
+    return relativeLuminance(color) > 0.45 ? SDL_Color{12, 12, 18, 255} : SDL_Color{250, 250, 252, 255};
+}
 
 // Tiny software canvas used to draw the built-in piece icons into an SDL surface.
 class PieceCanvas {
@@ -348,66 +450,109 @@ SDL_Surface* renderBuiltinPiece(PieceType type, SDL_Color fill, SDL_Color edge) 
     return canvas.release();
 }
 
+
 struct Vec3 { float x; float y; float z; };
 
 class ChessApp {
 public:
-    ~ChessApp() { destroyPieceTextures(); }
-    explicit ChessApp(SDL_Renderer* renderer)
-        : renderer_(renderer), computer_(std::filesystem::path("bin") / "stockfish") {
+    ~ChessApp() {
+        destroyPieceTextures();
+        destroyModelTextures();
+    }
+
+    ChessApp(SDL_Renderer* renderer, InputMap& input)
+        : renderer_(renderer), input_(input), computer_(std::filesystem::path("bin") / "stockfish") {
         settings_.load();
+        chessforge::setLanguage(settings_.language);
         loadAutosave();
-        cursor_ = settings_.playerWhite ? Board::square(4, 1) : Board::square(4, 6);
-        if (board_.sideToMove() != playerColor()) makeComputerMove();
+        resetCursors();
+        modeApplied_ = settings_.twoPlayer;
+        if (!settings_.twoPlayer && board_.sideToMove() != playerColor()) makeComputerMove();
+    }
+
+    // A pad button (see padid in input_map.hpp) went down or up.
+    void onPad(int id, bool down, bool repeat) {
+        if (captureAction_ >= 0) {
+            if (!down || repeat) return;
+            const bool swapped = input_.assign(static_cast<Action>(captureAction_), id);
+            input_.save("saves/controls.cfg");
+            captureAction_ = -1;
+            notice_ = tr(swapped ? Str::NSwapped : Str::NBound);
+            return;
+        }
+        if (!down) return;
+        if (const auto action = input_.lookup(id)) perform(*action);
     }
 
     void handleEvent(const SDL_Event& event) {
         if (event.type == SDL_QUIT) running_ = false;
-        if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT && !settingsOpen_) handlePointer(event.button.x, event.button.y);
+        if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT && !settingsOpen_ && !helpOpen_) handlePointer(event.button.x, event.button.y);
         if (event.type != SDL_KEYDOWN || event.key.repeat != 0) return;
         const SDL_Keycode key = event.key.keysym.sym;
-        if (key == SDLK_ESCAPE) { selected_ = -1; helpOpen_ = false; colorEdit_ = -1; return; }
-        if (key == SDLK_TAB || key == SDLK_x) { settings_.threeDimensional = !settings_.threeDimensional; settings_.save(); return; }
-        if (key == SDLK_s || key == SDLK_y) { settingsOpen_ = !settingsOpen_; helpOpen_ = false; colorEdit_ = -1; settings_.save(); return; }
-        if (key == SDLK_h || key == SDLK_F1) { helpOpen_ = !helpOpen_; settingsOpen_ = false; colorEdit_ = -1; return; }
-        if (key == SDLK_n || (key == SDLK_RETURN && gameOver())) { newGame(); return; }
-        if (settingsOpen_) { handleSettingsKey(key); return; }
-        if (helpOpen_) { if (key == SDLK_b || key == SDLK_BACKSPACE) helpOpen_ = false; return; }
-        if (key == SDLK_q) { settings_.yaw -= 0.10F; settings_.save(); return; }
-        if (key == SDLK_e) { settings_.yaw += 0.10F; settings_.save(); return; }
-        if (key == SDLK_u || key == SDLK_BACKSPACE) { undoTurn(); return; }
-        if (key == SDLK_b) { if (selected_ >= 0) selected_ = -1; else undoTurn(); return; }
-        if (key == SDLK_LEFT) moveCursor(-1, 0);
-        else if (key == SDLK_RIGHT) moveCursor(1, 0);
-        else if (key == SDLK_UP) moveCursor(0, -1);
-        else if (key == SDLK_DOWN) moveCursor(0, 1);
-        else if (key == SDLK_SPACE || key == SDLK_a) activateCursor();
+        if (key == SDLK_ESCAPE) {
+            escape();
+            return;
+        }
+        if (captureAction_ >= 0) return;
+        if (const auto action = keyAction(key)) perform(*action);
+    }
+
+    // Once per frame: the "press a button" prompt gives up after a few seconds.
+    void tick() {
+        if (captureAction_ >= 0 && SDL_GetTicks() >= captureDeadline_) {
+            captureAction_ = -1;
+            notice_ = tr(Str::NCancelled);
+        }
     }
 
     bool running() const { return running_; }
 
     void draw() {
         const Theme palette = currentTheme();
-        ensurePieceTextures(palette);
+        if (!settings_.threeDimensional) ensurePieceTextures(palette);
         fill(renderer_, {0, 0, ScreenWidth, ScreenHeight}, palette.background);
         if (settings_.threeDimensional) drawBoard3D(palette);
         else drawBoard2D(palette);
-        drawSidebar(palette);
+        if (!settingsOpen_ && !helpOpen_) drawSidebar(palette);
         if (settingsOpen_) drawSettings(palette);
+        if (settingsOpen_ && controlsOpen_) drawControls(palette);
         if (helpOpen_) drawHelp(palette);
     }
 
 private:
+    enum class Row { Language, Mode, Elo, Side, Flip, Theme, Texture, Camera, Pieces, Light, Dark, Accent, Background, Controls };
+
+    struct ModelInfo {
+        int width = 0;
+        int height = 0;
+        float anchorX = 0.0F;
+        float anchorY = 0.0F;
+        float pixelsPerUnit = 1.0F;
+    };
+
+    static constexpr float CameraDistance = 13.0F;
+    static constexpr int ModelPixelsPerUnit = 56;
+    static constexpr int SettingsVisibleRows = 9;
+    static constexpr int CaptureTimeoutMs = 5000;
+
     SDL_Renderer* renderer_;
+    InputMap& input_;
     Settings settings_;
     Board board_;
     ComputerPlayer computer_;
     std::vector<Board> history_;
     int cursor_ = Board::square(4, 1);
+    std::array<int, 2> cursors_{{Board::square(4, 1), Board::square(4, 6)}};  // two-player: remembered cursor of white / black
+    Color cursorOwner_ = Color::White;
+    bool modeApplied_ = false;
     int selected_ = -1;
     bool settingsOpen_ = false;
     bool helpOpen_ = false;
+    bool controlsOpen_ = false;
     int settingIndex_ = 0;
+    int controlsIndex_ = 0;
+    int captureAction_ = -1;
+    Uint32 captureDeadline_ = 0;
     int colorEdit_ = -1;
     int colorChannel_ = 0;
     bool running_ = true;
@@ -417,16 +562,123 @@ private:
     std::string builtSet_;
     SDL_Color builtWhite_{};
     SDL_Color builtBlack_{};
+    std::array<SDL_Texture*, 12> modelTextures_{};
+    SDL_Texture* shadowTexture_ = nullptr;
+    ModelInfo modelInfo_;
+    bool modelsBuilt_ = false;
+    float builtYaw_ = 0.0F;
+    float builtPitch_ = 0.0F;
+    SDL_Color builtModelWhite_{};
+    SDL_Color builtModelBlack_{};
     float camScale_ = 100.0F;
     float camCx_ = 226.0F;
     float camCy_ = 251.0F;
-    static constexpr float CameraDistance = 13.0F;
+
+    // ------------------------------------------------------------------ keys and actions
+
+    static std::optional<Action> keyAction(SDL_Keycode key) {
+        switch (key) {
+            case SDLK_UP: return Action::Up;
+            case SDLK_DOWN: return Action::Down;
+            case SDLK_LEFT: return Action::Left;
+            case SDLK_RIGHT: return Action::Right;
+            case SDLK_SPACE: case SDLK_a: case SDLK_RETURN: return Action::Confirm;
+            case SDLK_b: case SDLK_BACKSPACE: case SDLK_u: return Action::Back;
+            case SDLK_TAB: case SDLK_x: return Action::ToggleView;
+            case SDLK_s: case SDLK_y: return Action::Settings;
+            case SDLK_h: case SDLK_F1: return Action::Help;
+            case SDLK_n: return Action::NewGame;
+            case SDLK_q: return Action::CamLeft;
+            case SDLK_e: return Action::CamRight;
+            default: return std::nullopt;
+        }
+    }
+
+    void escape() {
+        if (captureAction_ >= 0) {
+            captureAction_ = -1;
+            notice_ = tr(Str::NCancelled);
+            return;
+        }
+        if (colorEdit_ >= 0) {
+            colorEdit_ = -1;
+            settings_.save();
+            return;
+        }
+        if (controlsOpen_) {
+            controlsOpen_ = false;
+            return;
+        }
+        selected_ = -1;
+        helpOpen_ = false;
+    }
+
+    void perform(Action action) {
+        switch (action) {
+            case Action::Quit: running_ = false; return;
+            case Action::ToggleView: settings_.threeDimensional = !settings_.threeDimensional; settings_.save(); return;
+            case Action::Settings:
+                if (settingsOpen_) {
+                    closeSettings();
+                } else {
+                    settingsOpen_ = true;
+                    helpOpen_ = false;
+                    colorEdit_ = -1;
+                    controlsOpen_ = false;
+                }
+                return;
+            case Action::Help:
+                if (settingsOpen_) closeSettings();
+                helpOpen_ = !helpOpen_;
+                return;
+            case Action::NewGame:
+                if (!settingsOpen_ && !helpOpen_) newGame();
+                return;
+            default: break;
+        }
+        if (settingsOpen_) {
+            handleSettingsAction(action);
+            return;
+        }
+        if (helpOpen_) {
+            if (action == Action::Back || action == Action::Confirm) helpOpen_ = false;
+            return;
+        }
+        switch (action) {
+            case Action::CamLeft: settings_.yaw -= 0.10F; settings_.save(); break;
+            case Action::CamRight: settings_.yaw += 0.10F; settings_.save(); break;
+            case Action::Back:
+                if (selected_ >= 0) selected_ = -1;
+                else undoTurn();
+                break;
+            case Action::Left: moveCursor(-1, 0); break;
+            case Action::Right: moveCursor(1, 0); break;
+            case Action::Up: moveCursor(0, -1); break;
+            case Action::Down: moveCursor(0, 1); break;
+            case Action::Confirm:
+                if (gameOver()) newGame();
+                else activateCursor();
+                break;
+            default: break;
+        }
+    }
+
+    // ------------------------------------------------------------------ game state
 
     [[nodiscard]] Color playerColor() const { return settings_.playerWhite ? Color::White : Color::Black; }
+    // Whose pieces the person holding the device moves right now.
+    [[nodiscard]] Color controlColor() const { return settings_.twoPlayer ? board_.sideToMove() : playerColor(); }
+    [[nodiscard]] bool humanTurn() const { return settings_.twoPlayer || board_.sideToMove() == playerColor(); }
     [[nodiscard]] bool gameOver() const { return board_.gameState() != GameState::Playing; }
-    [[nodiscard]] bool flipped() const { return !settings_.playerWhite; }
+    [[nodiscard]] bool flipped() const {
+        if (settings_.twoPlayer) return settings_.autoFlip && board_.sideToMove() == Color::Black;
+        return !settings_.playerWhite;
+    }
+    static std::size_t sideIndex(Color color) { return color == Color::White ? 0U : 1U; }
+
     [[nodiscard]] Theme currentTheme() const {
-        if (settings_.theme < 4) return Themes[static_cast<std::size_t>(settings_.theme)];
+        if (settings_.theme < CustomTheme) return Themes[static_cast<std::size_t>(settings_.theme)];
+        if (settings_.theme > CustomTheme) return LichessThemes[static_cast<std::size_t>(settings_.theme - CustomTheme - 1)];
         Theme custom = Themes[0];
         custom.background = settings_.customBackground;
         custom.panel = brighten(settings_.customBackground, 18);
@@ -449,17 +701,46 @@ private:
     void loadAutosave() {
         std::ifstream input("saves/autosave.fen");
         std::string stored;
-        if (std::getline(input, stored) && board_.loadFen(stored)) notice_ = "GAME RESTORED";
+        if (std::getline(input, stored) && board_.loadFen(stored)) notice_ = tr(Str::NRestored);
+    }
+
+    void resetCursors() {
+        cursors_ = {Board::square(4, 1), Board::square(4, 6)};
+        cursorOwner_ = board_.sideToMove();
+        if (settings_.twoPlayer) cursor_ = cursors_[sideIndex(cursorOwner_)];
+        else cursor_ = settings_.playerWhite ? Board::square(4, 1) : Board::square(4, 6);
+    }
+
+    // Two players keep their own cursor: after a move the cursor jumps to where the opponent left theirs.
+    void syncCursorToTurn() {
+        if (!settings_.twoPlayer) return;
+        const Color side = board_.sideToMove();
+        if (side == cursorOwner_) return;
+        cursors_[sideIndex(cursorOwner_)] = cursor_;
+        cursor_ = cursors_[sideIndex(side)];
+        cursorOwner_ = side;
     }
 
     void newGame() {
         board_.reset();
         history_.clear();
         selected_ = -1;
-        notice_ = "NEW GAME";
-        cursor_ = settings_.playerWhite ? Board::square(4, 1) : Board::square(4, 6);
+        notice_ = tr(Str::NNew);
+        resetCursors();
         saveAutosave();
-        if (board_.sideToMove() != playerColor()) makeComputerMove();
+        if (!settings_.twoPlayer && board_.sideToMove() != playerColor()) makeComputerMove();
+    }
+
+    // Called when the settings close: the mode or side may have changed in the middle of a game.
+    void applyGameSettings() {
+        selected_ = -1;
+        if (settings_.twoPlayer != modeApplied_) {
+            modeApplied_ = settings_.twoPlayer;
+            cursorOwner_ = board_.sideToMove();
+            cursors_ = {Board::square(4, 1), Board::square(4, 6)};
+            cursors_[sideIndex(cursorOwner_)] = cursor_;
+        }
+        if (!settings_.twoPlayer && !gameOver() && board_.sideToMove() != playerColor()) makeComputerMove();
     }
 
     void moveCursor(int visualX, int visualY) {
@@ -481,12 +762,13 @@ private:
     }
 
     void activateCursor() {
-        if (gameOver() || board_.sideToMove() != playerColor()) return;
+        if (gameOver() || !humanTurn()) return;
+        const Color mine = controlColor();
         const Piece piece = board_.at(cursor_);
         if (selected_ < 0) {
-            if (!piece.empty() && piece.color == playerColor()) {
+            if (!piece.empty() && piece.color == mine) {
                 selected_ = cursor_;
-                notice_ = "SELECT DESTINATION";
+                notice_ = tr(Str::NSelectDest);
             }
             return;
         }
@@ -496,39 +778,42 @@ private:
             board_.makeMove(*move);
             selected_ = -1;
             saveAutosave();
+            syncCursorToTurn();
+            if (settings_.twoPlayer) notice_.clear();
             if (!gameOver()) makeComputerMove();
             return;
         }
-        if (!piece.empty() && piece.color == playerColor()) {
+        if (!piece.empty() && piece.color == mine) {
             selected_ = cursor_;
-            notice_ = "PIECE CHANGED";
+            notice_ = tr(Str::NPieceChanged);
         } else {
-            notice_ = "ILLEGAL MOVE";
+            notice_ = tr(Str::NIllegal);
         }
     }
 
     void makeComputerMove() {
-        if (gameOver() || board_.sideToMove() == playerColor()) return;
-        notice_ = computer_.hasStockfish() ? "STOCKFISH THINKING" : "BUILTIN BOT THINKING";
+        if (settings_.twoPlayer || gameOver() || board_.sideToMove() == playerColor()) return;
+        notice_ = tr(computer_.hasStockfish() ? Str::NSfThink : Str::NBiThink);
         SDL_RenderPresent(renderer_);
         const int thinkingTime = std::clamp(140 + settings_.elo / 3, 200, 1100);
         if (const auto move = computer_.chooseMove(board_, settings_.elo, thinkingTime)) {
             history_.push_back(board_);
             board_.makeMove(*move);
-            notice_ = computer_.hasStockfish() ? "STOCKFISH MOVED" : "BUILTIN BOT MOVED";
+            notice_ = tr(computer_.hasStockfish() ? Str::NSfMoved : Str::NBiMoved);
             saveAutosave();
         }
     }
 
     void undoTurn() {
         if (history_.empty()) return;
-        const bool afterComputer = board_.sideToMove() == playerColor();
+        const bool afterComputer = !settings_.twoPlayer && board_.sideToMove() == playerColor();
         const std::size_t steps = afterComputer && history_.size() >= 2 ? 2 : 1;
         board_ = history_[history_.size() - steps];
         history_.resize(history_.size() - steps);
         selected_ = -1;
-        notice_ = "TURN UNDONE";
+        notice_ = tr(Str::NUndone);
         saveAutosave();
+        syncCursorToTurn();
     }
 
     void handlePointer(int x, int y) {
@@ -542,55 +827,160 @@ private:
         }
     }
 
-    void handleSettingsKey(SDL_Keycode key) {
+    // ------------------------------------------------------------------ settings
+
+    [[nodiscard]] std::vector<Row> settingRows() const {
+        std::vector<Row> rows{Row::Language, Row::Mode};
+        if (settings_.twoPlayer) {
+            rows.push_back(Row::Flip);
+        } else {
+            rows.push_back(Row::Elo);
+            rows.push_back(Row::Side);
+        }
+        for (const Row row : {Row::Theme, Row::Texture, Row::Camera, Row::Pieces, Row::Light, Row::Dark, Row::Accent, Row::Background, Row::Controls}) rows.push_back(row);
+        return rows;
+    }
+
+    void closeSettings() {
+        settingsOpen_ = false;
+        controlsOpen_ = false;
+        colorEdit_ = -1;
+        settings_.save();
+        applyGameSettings();
+    }
+
+    void handleSettingsAction(Action action) {
+        if (controlsOpen_) {
+            handleControlsAction(action);
+            return;
+        }
         if (colorEdit_ >= 0) {
             SDL_Color* target = colorEdit_ == 0 ? &settings_.customLight : colorEdit_ == 1 ? &settings_.customDark : colorEdit_ == 2 ? &settings_.customAccent : &settings_.customBackground;
-            if (key == SDLK_SPACE || key == SDLK_a || key == SDLK_b || key == SDLK_RETURN) {
+            if (action == Action::Confirm || action == Action::Back) {
                 colorEdit_ = -1;
                 settings_.save();
-                return;
-            }
-            if (key == SDLK_UP) colorChannel_ = (colorChannel_ + 2) % 3;
-            else if (key == SDLK_DOWN) colorChannel_ = (colorChannel_ + 1) % 3;
-            else if (key == SDLK_LEFT || key == SDLK_RIGHT) {
+            } else if (action == Action::Up) {
+                colorChannel_ = (colorChannel_ + 2) % 3;
+            } else if (action == Action::Down) {
+                colorChannel_ = (colorChannel_ + 1) % 3;
+            } else if (action == Action::Left || action == Action::Right) {
                 Uint8* channel = colorChannel_ == 0 ? &target->r : colorChannel_ == 1 ? &target->g : &target->b;
-                const int delta = key == SDLK_LEFT ? -5 : 5;
+                const int delta = action == Action::Left ? -5 : 5;
                 *channel = static_cast<Uint8>(std::clamp(static_cast<int>(*channel) + delta, 0, 255));
-                settings_.theme = 4;
+                settings_.theme = CustomTheme;
                 settings_.save();
             }
             return;
         }
-        if (key == SDLK_SPACE || key == SDLK_a || key == SDLK_RETURN) {
-            if (settingIndex_ >= 6) {
-                colorEdit_ = settingIndex_ - 6;
-                colorChannel_ = 0;
-                return;
-            }
-            settingsOpen_ = false;
-            settings_.save();
-            return;
+        const std::vector<Row> rows = settingRows();
+        const int count = static_cast<int>(rows.size());
+        settingIndex_ = std::clamp(settingIndex_, 0, count - 1);
+        const Row row = rows[static_cast<std::size_t>(settingIndex_)];
+        switch (action) {
+            case Action::Confirm:
+                if (row >= Row::Light && row <= Row::Background) {
+                    colorEdit_ = static_cast<int>(row) - static_cast<int>(Row::Light);
+                    colorChannel_ = 0;
+                } else if (row == Row::Controls) {
+                    controlsOpen_ = true;
+                    controlsIndex_ = 0;
+                } else {
+                    closeSettings();
+                }
+                break;
+            case Action::Back: closeSettings(); break;
+            case Action::Up: settingIndex_ = (settingIndex_ + count - 1) % count; break;
+            case Action::Down: settingIndex_ = (settingIndex_ + 1) % count; break;
+            case Action::Left: adjustSetting(row, -1); break;
+            case Action::Right: adjustSetting(row, 1); break;
+            default: break;
         }
-        if (key == SDLK_b) { settingsOpen_ = false; settings_.save(); return; }
-        if (key == SDLK_UP) settingIndex_ = (settingIndex_ + 9) % 10;
-        else if (key == SDLK_DOWN) settingIndex_ = (settingIndex_ + 1) % 10;
-        else if (key == SDLK_LEFT || key == SDLK_RIGHT) {
-            const int direction = key == SDLK_LEFT ? -1 : 1;
-            if (settingIndex_ == 0) settings_.theme = (settings_.theme + direction + 5) % 5;
-            if (settingIndex_ == 1) settings_.texture = (settings_.texture + direction + 5) % 5;
-            if (settingIndex_ == 2) settings_.elo = std::clamp(settings_.elo + direction * 100, 400, 3200);
-            if (settingIndex_ == 3) settings_.playerWhite = !settings_.playerWhite;
-            if (settingIndex_ == 4) settings_.pitch = std::clamp(settings_.pitch + static_cast<float>(direction) * 0.05F, 0.30F, 1.10F);
-            if (settingIndex_ == 5) {
+    }
+
+    void adjustSetting(Row row, int direction) {
+        switch (row) {
+            case Row::Language:
+                settings_.language = (settings_.language + direction + chessforge::LanguageCount) % chessforge::LanguageCount;
+                chessforge::setLanguage(settings_.language);
+                notice_.clear();
+                break;
+            case Row::Mode: settings_.twoPlayer = !settings_.twoPlayer; break;
+            case Row::Elo: settings_.elo = std::clamp(settings_.elo + direction * 100, 400, 3200); break;
+            case Row::Side: settings_.playerWhite = !settings_.playerWhite; break;
+            case Row::Flip: settings_.autoFlip = !settings_.autoFlip; break;
+            case Row::Theme: settings_.theme = (settings_.theme + direction + ThemeCount) % ThemeCount; break;
+            case Row::Texture: settings_.texture = (settings_.texture + direction + 5) % 5; break;
+            case Row::Camera: settings_.pitch = std::clamp(settings_.pitch + static_cast<float>(direction) * 0.05F, 0.30F, 1.10F); break;
+            case Row::Pieces: {
                 const std::vector<std::string> sets = pieceSets();
                 std::size_t current = 0;
                 for (std::size_t index = 0; index < sets.size(); ++index) if (sets[index] == settings_.pieceSet) current = index;
                 const int count = static_cast<int>(sets.size());
                 settings_.pieceSet = sets[static_cast<std::size_t>((static_cast<int>(current) + direction + count) % count)];
+                break;
             }
-            settings_.save();
+            default: return;
+        }
+        settings_.save();
+    }
+
+    void handleControlsAction(Action action) {
+        constexpr int Rows = ActionRows + 1;  // every action plus "reset to default"
+        switch (action) {
+            case Action::Up: controlsIndex_ = (controlsIndex_ + Rows - 1) % Rows; break;
+            case Action::Down: controlsIndex_ = (controlsIndex_ + 1) % Rows; break;
+            case Action::Back: controlsOpen_ = false; break;
+            case Action::Confirm:
+                if (controlsIndex_ == ActionRows) {
+                    input_.resetDefaults();
+                    input_.save("saves/controls.cfg");
+                    notice_ = tr(Str::NControlsReset);
+                } else {
+                    captureAction_ = controlsIndex_;
+                    captureDeadline_ = SDL_GetTicks() + CaptureTimeoutMs;
+                }
+                break;
+            default: break;
         }
     }
+
+    static constexpr int ActionRows = chessforge::ActionCount;
+
+    static std::string actionName(Action action) {
+        switch (action) {
+            case Action::Up: return tr(Str::AUp);
+            case Action::Down: return tr(Str::ADown);
+            case Action::Left: return tr(Str::ALeft);
+            case Action::Right: return tr(Str::ARight);
+            case Action::Confirm: return tr(Str::AConfirm);
+            case Action::Back: return tr(Str::ABack);
+            case Action::ToggleView: return tr(Str::AView);
+            case Action::Settings: return tr(Str::HintSettings);
+            case Action::NewGame: return tr(Str::HintNew);
+            case Action::Help: return tr(Str::HintHelp);
+            case Action::CamLeft: return tr(Str::ACamLeft);
+            case Action::CamRight: return tr(Str::ACamRight);
+            case Action::Quit: return tr(Str::AQuit);
+            case Action::Count: break;
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::string hint(Action action, Str text) const { return input_.label(action) + " " + tr(text); }
+
+    // "DPAD" when the four directions are on the D-pad, otherwise the four buttons.
+    [[nodiscard]] std::string directionLabel() const {
+        bool dpad = true;
+        for (const Action action : {Action::Up, Action::Down, Action::Left, Action::Right}) {
+            const auto& list = input_.bindings(action);
+            if (list.empty() || list.front() < chessforge::padid::ControllerButton + chessforge::padid::DpadUp ||
+                list.front() > chessforge::padid::ControllerButton + chessforge::padid::DpadRight) dpad = false;
+        }
+        if (dpad) return "DPAD";
+        return input_.label(Action::Up) + " " + input_.label(Action::Down) + " " + input_.label(Action::Left) + " " + input_.label(Action::Right);
+    }
+
+    // ------------------------------------------------------------------ board geometry and colours
 
     SDL_Rect squareRect(int square) const {
         const int file = Board::fileOf(square);
@@ -615,6 +1005,28 @@ private:
             case 4: return brighten(base, ((file * 11 + rank * 19) % 9) - 4);
             default: return base;
         }
+    }
+
+    SDL_Color squareColor(int square, const Theme& palette) const {
+        const int file = Board::fileOf(square);
+        const int rank = Board::rankOf(square);
+        const SDL_Color base = ((file + rank) & 1) == 0 ? palette.darkSquare : palette.lightSquare;
+        return texturedSquareColor(base, file, rank);
+    }
+
+    // The cursor colour is chosen against the real colour of the square under it, so it never blends in.
+    SDL_Color cursorColor(int square, const Theme& palette) const {
+        return pickContrast(squareColor(square, palette), {palette.highlight, palette.accent, darken(palette.accent, 100), darken(palette.highlight, 120)});
+    }
+
+    SDL_Color selectionColor(int square, const Theme& palette) const {
+        std::optional<SDL_Color> avoid;
+        if (square == cursor_) avoid = cursorColor(square, palette);
+        return pickContrast(squareColor(square, palette), {palette.accent, palette.highlight, darken(palette.accent, 100), darken(palette.highlight, 120)}, avoid);
+    }
+
+    SDL_Color markerColor(int square, const Theme& palette) const {
+        return pickContrast(squareColor(square, palette), {palette.accent, palette.highlight, darken(palette.accent, 100), darken(palette.highlight, 120)});
     }
 
     void drawTexture2D(const SDL_Rect& cell, int file, int rank, SDL_Color base) {
@@ -658,6 +1070,8 @@ private:
         std::sort(sets.begin() + 1, sets.end());
         return sets;
     }
+
+    // ------------------------------------------------------------------ 2D pieces (built-in vector art or BMP sets)
 
     void destroyPieceTextures() {
         for (SDL_Texture*& texture : pieceTextures_) {
@@ -716,28 +1130,73 @@ private:
         SDL_RenderCopy(renderer_, texture, nullptr, &target);
     }
 
+    // Thick frame with a thin black/white halo on both sides so it is visible on any colour.
+    void drawFrame2D(SDL_Rect cell, SDL_Color color, int inset, int thickness) {
+        const SDL_Color halo = haloFor(color);
+        const auto ring = [&](int offset, SDL_Color c, int width) {
+            outline(renderer_, {cell.x + offset, cell.y + offset, cell.w - 2 * offset, cell.h - 2 * offset}, c, width);
+        };
+        ring(inset, halo, 1);
+        ring(inset + 1, color, thickness);
+        ring(inset + 1 + thickness, halo, 1);
+    }
+
+    // Corner brackets mark a square where the selected piece can capture.
+    void drawCorners2D(SDL_Rect cell, SDL_Color color) {
+        const SDL_Color halo = haloFor(color);
+        constexpr int Length = 14;
+        constexpr int Thick = 3;
+        const auto bracket = [&](int cornerX, int cornerY, int dx, int dy, SDL_Color c, int grow) {
+            const int x0 = cornerX;
+            const int y0 = cornerY;
+            const SDL_Rect horizontal{dx > 0 ? x0 - grow : x0 - Length - grow, dy > 0 ? y0 - grow : y0 - Thick - grow, Length + 2 * grow, Thick + 2 * grow};
+            const SDL_Rect vertical{dx > 0 ? x0 - grow : x0 - Thick - grow, dy > 0 ? y0 - grow : y0 - Length - grow, Thick + 2 * grow, Length + 2 * grow};
+            fill(renderer_, horizontal, c);
+            fill(renderer_, vertical, c);
+        };
+        for (const SDL_Color& pass : {halo, color}) {
+            const int grow = sameColor(pass, halo) ? 1 : 0;
+            bracket(cell.x + 3, cell.y + 3, 1, 1, pass, grow);
+            bracket(cell.x + cell.w - 3, cell.y + 3, -1, 1, pass, grow);
+            bracket(cell.x + 3, cell.y + cell.h - 3, 1, -1, pass, grow);
+            bracket(cell.x + cell.w - 3, cell.y + cell.h - 3, -1, -1, pass, grow);
+        }
+    }
+
     void drawBoard2D(const Theme& palette) {
         for (int square = 0; square < 64; ++square) {
             const int file = Board::fileOf(square);
             const int rank = Board::rankOf(square);
-            const SDL_Color base = ((file + rank) & 1) == 0 ? palette.darkSquare : palette.lightSquare;
-            const SDL_Color color = texturedSquareColor(base, file, rank);
+            const SDL_Color color = squareColor(square, palette);
             const SDL_Rect cell = squareRect(square);
             fill(renderer_, cell, color);
             drawTexture2D(cell, file, rank, color);
-            if (square == selected_) outline(renderer_, cell, palette.accent, 3);
-            if (square == cursor_) outline(renderer_, cell, palette.highlight, 2);
-            if (legalDestination(square)) {
-                fill(renderer_, {cell.x + 21, cell.y + 21, 10, 10}, palette.accent);
+            if (legalDestination(square) && board_.at(square).empty()) {
+                const SDL_Color marker = markerColor(square, palette);
+                fill(renderer_, {cell.x + 18, cell.y + 18, 16, 16}, haloFor(marker));
+                fill(renderer_, {cell.x + 19, cell.y + 19, 14, 14}, marker);
             }
         }
         for (int square = 0; square < 64; ++square) {
             const Piece piece = board_.at(square);
             if (!piece.empty()) drawPiece2D(square, piece, palette);
         }
-        drawText(renderer_, BoardLeft, 14, "A B C D E F G H", 2, palette.text);
-        drawText(renderer_, BoardLeft + BoardPixels + 6, BoardTop + BoardPixels - 9, "1 2 3 4 5 6 7 8", 1, palette.text);
+        for (int square = 0; square < 64; ++square) {
+            if (legalDestination(square) && !board_.at(square).empty()) drawCorners2D(squareRect(square), markerColor(square, palette));
+        }
+        if (selected_ >= 0) drawFrame2D(squareRect(selected_), selectionColor(selected_, palette), 0, 3);
+        drawFrame2D(squareRect(cursor_), cursorColor(cursor_, palette), cursor_ == selected_ ? 5 : 0, 3);
+        for (int column = 0; column < 8; ++column) {
+            const int file = flipped() ? 7 - column : column;
+            drawText(renderer_, BoardLeft + column * SquareSize + (SquareSize - 10) / 2, 14, std::string(1, static_cast<char>('A' + file)), 2, palette.text);
+        }
+        for (int row = 0; row < 8; ++row) {
+            const int rank = flipped() ? row : 7 - row;
+            drawText(renderer_, BoardLeft + BoardPixels + 5, BoardTop + row * SquareSize + (SquareSize - 7) / 2, std::to_string(rank + 1), 1, palette.text);
+        }
     }
+
+    // ------------------------------------------------------------------ 3D board
 
     [[nodiscard]] float effectiveYaw() const { return settings_.yaw + (flipped() ? Pi : 0.0F); }
 
@@ -759,9 +1218,9 @@ private:
         float maxX = -1e9F;
         float minY = 1e9F;
         float maxY = -1e9F;
-        for (const float x : {-4.15F, 4.15F}) {
-            for (const float z : {-4.15F, 4.15F}) {
-                for (const float y : {0.0F, 1.25F}) {
+        for (const float x : {-4.3F, 4.3F}) {
+            for (const float z : {-4.3F, 4.3F}) {
+                for (const float y : {0.0F, 1.35F}) {
                     const Vec3 c = toCamera({x, y, z});
                     const float inverse = 1.0F / std::max(3.0F, CameraDistance + c.z);
                     minX = std::min(minX, c.x * inverse);
@@ -776,18 +1235,14 @@ private:
         camCy_ = 256.0F - (minY + maxY) * 0.5F * camScale_;
     }
 
+    [[nodiscard]] float perspectiveAt(Vec3 point) const {
+        return camScale_ / std::max(3.0F, CameraDistance + toCamera(point).z);
+    }
+
     SDL_Point project(Vec3 point) const {
         const Vec3 c = toCamera(point);
         const float perspective = camScale_ / std::max(3.0F, CameraDistance + c.z);
         return {static_cast<int>(std::lround(camCx_ + c.x * perspective)), static_cast<int>(std::lround(camCy_ - c.y * perspective))};
-    }
-
-    [[nodiscard]] bool faceVisible(Vec3 center, Vec3 normal) const {
-        const Vec3 origin = toCamera({0.0F, 0.0F, 0.0F});
-        const Vec3 rotated = toCamera(normal);
-        const Vec3 n{rotated.x - origin.x, rotated.y - origin.y, rotated.z - origin.z};
-        const Vec3 c = toCamera(center);
-        return n.x * c.x + n.y * c.y + n.z * (c.z + CameraDistance) < 0.0F;
     }
 
     void fillTriangle(SDL_Point first, SDL_Point second, SDL_Point third, SDL_Color color) {
@@ -839,199 +1294,412 @@ private:
         }
     }
 
-    void drawOutline3D(int square, SDL_Color color) {
-        const float file = static_cast<float>(Board::fileOf(square)) - 4.0F;
-        const float rank = static_cast<float>(Board::rankOf(square)) - 4.0F;
-        const std::array<SDL_Point, 4> points{{project({file, 0.05F, rank}), project({file + 1.0F, 0.05F, rank}), project({file + 1.0F, 0.05F, rank + 1.0F}), project({file, 0.05F, rank + 1.0F})}};
+    // One square outline, shrunk by `inset` (in squares), lying slightly above the board.
+    void drawSquareOutline3D(int square, float inset, SDL_Color color) {
+        const float x = static_cast<float>(Board::fileOf(square)) - 4.0F + inset;
+        const float z = static_cast<float>(Board::rankOf(square)) - 4.0F + inset;
+        const float size = 1.0F - 2.0F * inset;
+        const std::array<SDL_Point, 4> points{{project({x, 0.02F, z}), project({x + size, 0.02F, z}), project({x + size, 0.02F, z + size}), project({x, 0.02F, z + size})}};
         setColor(renderer_, color);
-        for (int index = 0; index < 4; ++index) SDL_RenderDrawLine(renderer_, points[index].x, points[index].y, points[(index + 1) % 4].x, points[(index + 1) % 4].y);
+        for (int index = 0; index < 4; ++index) SDL_RenderDrawLine(renderer_, points[static_cast<std::size_t>(index)].x, points[static_cast<std::size_t>(index)].y, points[static_cast<std::size_t>((index + 1) % 4)].x, points[static_cast<std::size_t>((index + 1) % 4)].y);
     }
 
-    void drawBox(float centerX, float centerZ, float bottom, float height, float width, SDL_Color color) {
-        const float half = width / 2.0F;
-        const float top = bottom + height;
-        const float middle = bottom + height / 2.0F;
-        const Vec3 a{centerX - half, bottom, centerZ - half};
-        const Vec3 b{centerX + half, bottom, centerZ - half};
-        const Vec3 c{centerX + half, bottom, centerZ + half};
-        const Vec3 d{centerX - half, bottom, centerZ + half};
-        const Vec3 e{centerX - half, top, centerZ - half};
-        const Vec3 f{centerX + half, top, centerZ - half};
-        const Vec3 g{centerX + half, top, centerZ + half};
-        const Vec3 h{centerX - half, top, centerZ + half};
-        if (faceVisible({centerX, middle, centerZ - half}, {0.0F, 0.0F, -1.0F})) fillQuad(a, b, f, e, darken(color, 25));
-        if (faceVisible({centerX + half, middle, centerZ}, {1.0F, 0.0F, 0.0F})) fillQuad(b, c, g, f, color);
-        if (faceVisible({centerX, middle, centerZ + half}, {0.0F, 0.0F, 1.0F})) fillQuad(c, d, h, g, brighten(color, 15));
-        if (faceVisible({centerX - half, middle, centerZ}, {-1.0F, 0.0F, 0.0F})) fillQuad(d, a, e, h, darken(color, 45));
-        if (faceVisible({centerX, top, centerZ}, {0.0F, 1.0F, 0.0F})) fillQuad(e, f, g, h, brighten(color, 20));
+    // Thick frame (three lines plus a halo on both sides) so the cursor stays visible on every square colour.
+    void drawFrame3D(int square, SDL_Color color, float inset) {
+        const SDL_Color halo = haloFor(color);
+        drawSquareOutline3D(square, inset, halo);
+        for (const float step : {0.028F, 0.052F, 0.076F}) drawSquareOutline3D(square, inset + step, color);
+        drawSquareOutline3D(square, inset + 0.10F, halo);
     }
 
-    void drawPiece3D(int square, Piece piece, const Theme& palette) {
-        const float x = static_cast<float>(Board::fileOf(square)) - 3.5F;
-        const float z = static_cast<float>(Board::rankOf(square)) - 3.5F;
-        const SDL_Color color = piece.color == Color::White ? palette.whitePiece : palette.blackPiece;
-        drawBox(x, z, 0.03F, 0.10F, 0.72F, darken(color, 15));
-        switch (piece.type) {
-            case PieceType::Pawn:
-                drawBox(x, z, 0.13F, 0.40F, 0.38F, color);
-                drawBox(x, z, 0.53F, 0.22F, 0.46F, brighten(color, 8));
-                break;
-            case PieceType::Knight:
-                drawBox(x, z, 0.13F, 0.50F, 0.52F, color);
-                drawBox(x + 0.10F, z - 0.05F, 0.63F, 0.34F, 0.38F, brighten(color, 6));
-                break;
-            case PieceType::Bishop:
-                drawBox(x, z, 0.13F, 0.55F, 0.48F, color);
-                drawBox(x, z, 0.68F, 0.27F, 0.30F, brighten(color, 10));
-                break;
-            case PieceType::Rook:
-                drawBox(x, z, 0.13F, 0.62F, 0.55F, color);
-                drawBox(x, z, 0.75F, 0.14F, 0.70F, brighten(color, 3));
-                break;
-            case PieceType::Queen:
-                drawBox(x, z, 0.13F, 0.58F, 0.52F, color);
-                drawBox(x, z, 0.71F, 0.20F, 0.38F, brighten(color, 12));
-                drawBox(x, z, 0.91F, 0.08F, 0.24F, color);
-                break;
-            case PieceType::King:
-                drawBox(x, z, 0.13F, 0.68F, 0.52F, color);
-                drawBox(x, z, 0.81F, 0.18F, 0.34F, brighten(color, 12));
-                drawBox(x, z, 0.99F, 0.12F, 0.12F, brighten(color, 25));
-                drawBox(x, z, 1.04F, 0.03F, 0.34F, brighten(color, 25));
-                break;
-            case PieceType::None: break;
+    void drawDisc3D(int square, float radius, SDL_Color color) {
+        const Vec3 centre{static_cast<float>(Board::fileOf(square)) - 3.5F, 0.02F, static_cast<float>(Board::rankOf(square)) - 3.5F};
+        constexpr int Segments = 12;
+        const SDL_Point middle = project(centre);
+        std::array<SDL_Point, Segments> ring{};
+        for (int i = 0; i < Segments; ++i) {
+            const float angle = 2.0F * Pi * static_cast<float>(i) / static_cast<float>(Segments);
+            ring[static_cast<std::size_t>(i)] = project({centre.x + radius * std::cos(angle), centre.y, centre.z + radius * std::sin(angle)});
         }
+        for (int i = 0; i < Segments; ++i) fillTriangle(middle, ring[static_cast<std::size_t>(i)], ring[static_cast<std::size_t>((i + 1) % Segments)], color);
+    }
+
+    void drawRing3D(int square, float radius, SDL_Color color) {
+        const Vec3 centre{static_cast<float>(Board::fileOf(square)) - 3.5F, 0.02F, static_cast<float>(Board::rankOf(square)) - 3.5F};
+        constexpr int Segments = 24;
+        setColor(renderer_, color);
+        SDL_Point previous = project({centre.x + radius, centre.y, centre.z});
+        for (int i = 1; i <= Segments; ++i) {
+            const float angle = 2.0F * Pi * static_cast<float>(i) / static_cast<float>(Segments);
+            const SDL_Point next = project({centre.x + radius * std::cos(angle), centre.y, centre.z + radius * std::sin(angle)});
+            SDL_RenderDrawLine(renderer_, previous.x, previous.y, next.x, next.y);
+            previous = next;
+        }
+    }
+
+    void drawMarker3D(int square, const Theme& palette) {
+        const SDL_Color color = markerColor(square, palette);
+        const SDL_Color halo = haloFor(color);
+        if (board_.at(square).empty()) {
+            drawDisc3D(square, 0.17F, halo);
+            drawDisc3D(square, 0.125F, color);
+        } else {
+            for (const float radius : {0.37F, 0.465F}) drawRing3D(square, radius, halo);
+            for (const float radius : {0.40F, 0.425F, 0.44F}) drawRing3D(square, radius, color);
+        }
+    }
+
+    // ------------------------------------------------------------------ 3D piece models (pre-rendered, shaded sprites)
+
+    void destroyModelTextures() {
+        for (SDL_Texture*& texture : modelTextures_) {
+            if (texture != nullptr) SDL_DestroyTexture(texture);
+            texture = nullptr;
+        }
+        if (shadowTexture_ != nullptr) SDL_DestroyTexture(shadowTexture_);
+        shadowTexture_ = nullptr;
+        modelsBuilt_ = false;
+    }
+
+    SDL_Texture* textureFromSprite(const chessforge::SpriteImage& sprite) const {
+        SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormat(0, sprite.width, sprite.height, 32, SDL_PIXELFORMAT_RGBA32);
+        if (surface == nullptr) return nullptr;
+        const std::size_t rowBytes = static_cast<std::size_t>(sprite.width) * 4U;
+        for (int y = 0; y < sprite.height; ++y) {
+            std::memcpy(static_cast<Uint8*>(surface->pixels) + static_cast<std::size_t>(y) * static_cast<std::size_t>(surface->pitch),
+                        sprite.rgba.data() + static_cast<std::size_t>(y) * rowBytes, rowBytes);
+        }
+        SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer_, surface);
+        SDL_FreeSurface(surface);
+        if (texture != nullptr) SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+        return texture;
+    }
+
+    // The models are rendered once per camera angle / colour set (not every frame).
+    void ensureModels(const Theme& palette) {
+        const float yaw = effectiveYaw();
+        const float pitch = settings_.pitch;
+        if (modelsBuilt_ && std::abs(builtYaw_ - yaw) < 1e-4F && std::abs(builtPitch_ - pitch) < 1e-4F &&
+            sameColor(builtModelWhite_, palette.whitePiece) && sameColor(builtModelBlack_, palette.blackPiece)) return;
+        destroyModelTextures();
+        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+        constexpr std::array<PieceType, 6> types{{PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen, PieceType::King}};
+        for (std::size_t color = 0; color < 2; ++color) {
+            const SDL_Color body = color == 0 ? palette.whitePiece : palette.blackPiece;
+            const chessforge::Rgb8 edge = relativeLuminance(body) > 0.3 ? chessforge::Rgb8{22, 22, 28} : chessforge::Rgb8{238, 238, 244};
+            for (std::size_t type = 0; type < 6; ++type) {
+                const chessforge::SpriteImage sprite = chessforge::renderPieceSprite(types[type], color == 0, yaw, pitch, {body.r, body.g, body.b}, edge, ModelPixelsPerUnit);
+                modelInfo_ = {sprite.width, sprite.height, sprite.anchorX, sprite.anchorY, sprite.pixelsPerUnit};
+                modelTextures_[color * 6 + type] = textureFromSprite(sprite);
+            }
+        }
+        shadowTexture_ = textureFromSprite(chessforge::renderShadowSprite(64));
+        builtYaw_ = yaw;
+        builtPitch_ = pitch;
+        builtModelWhite_ = palette.whitePiece;
+        builtModelBlack_ = palette.blackPiece;
+        modelsBuilt_ = true;
+    }
+
+    void drawPiece3D(int square, Piece piece, bool lifted) {
+        SDL_Texture* texture = modelTextures_[pieceIndex(piece)];
+        if (texture == nullptr) return;
+        const Vec3 centre{static_cast<float>(Board::fileOf(square)) - 3.5F, 0.0F, static_cast<float>(Board::rankOf(square)) - 3.5F};
+        const float perspective = perspectiveAt(centre);
+        const SDL_Point base = project(centre);
+        if (shadowTexture_ != nullptr) {
+            const float width = 1.0F * perspective;
+            const float height = std::max(4.0F, width * std::sin(settings_.pitch));
+            const SDL_Rect shadow{static_cast<int>(std::lround(static_cast<float>(base.x) - width / 2.0F)), static_cast<int>(std::lround(static_cast<float>(base.y) - height / 2.0F)),
+                                  static_cast<int>(std::lround(width)), static_cast<int>(std::lround(height))};
+            SDL_RenderCopy(renderer_, shadowTexture_, nullptr, &shadow);
+        }
+        const float scale = perspective / modelInfo_.pixelsPerUnit;
+        const float lift = lifted ? 0.22F * perspective * std::cos(settings_.pitch) : 0.0F;
+        const SDL_Rect target{static_cast<int>(std::lround(static_cast<float>(base.x) - modelInfo_.anchorX * scale)),
+                              static_cast<int>(std::lround(static_cast<float>(base.y) - modelInfo_.anchorY * scale - lift)),
+                              static_cast<int>(std::lround(static_cast<float>(modelInfo_.width) * scale)),
+                              static_cast<int>(std::lround(static_cast<float>(modelInfo_.height) * scale))};
+        SDL_RenderCopy(renderer_, texture, nullptr, &target);
     }
 
     void drawBoard3D(const Theme& palette) {
         updateCamera();
+        ensureModels(palette);
         for (int rank = 0; rank < 8; ++rank) {
             for (int file = 0; file < 8; ++file) {
-                const SDL_Color base = ((file + rank) & 1) == 0 ? palette.darkSquare : palette.lightSquare;
-                const SDL_Color color = texturedSquareColor(base, file, rank);
+                const SDL_Color color = squareColor(Board::square(file, rank), palette);
                 const float x = static_cast<float>(file) - 4.0F;
                 const float z = static_cast<float>(rank) - 4.0F;
                 fillQuad({x, 0.0F, z}, {x + 1.0F, 0.0F, z}, {x + 1.0F, 0.0F, z + 1.0F}, {x, 0.0F, z + 1.0F}, color);
                 drawTexture3D(file, rank, color);
             }
         }
-        if (selected_ >= 0) drawOutline3D(selected_, palette.accent);
-        drawOutline3D(cursor_, palette.highlight);
-        for (int square = 0; square < 64; ++square) if (legalDestination(square)) drawOutline3D(square, palette.accent);
-
-        // Painter's algorithm: farthest pieces first.
-        std::vector<std::pair<float, int>> order;
-        for (int square = 0; square < 64; ++square) {
-            if (board_.at(square).empty()) continue;
-            const Vec3 centre{static_cast<float>(Board::fileOf(square)) - 3.5F, 0.3F, static_cast<float>(Board::rankOf(square)) - 3.5F};
-            order.emplace_back(toCamera(centre).z, square);
+        // Coordinates along the white edge (files) and the left edge (ranks) of the board.
+        for (int index = 0; index < 8; ++index) {
+            const SDL_Point fileLabel = project({static_cast<float>(index) - 3.5F, 0.0F, -4.28F});
+            drawText(renderer_, fileLabel.x - 3, fileLabel.y - 4, std::string(1, static_cast<char>('A' + index)), 1, palette.text);
+            const SDL_Point rankLabel = project({-4.28F, 0.0F, static_cast<float>(index) - 3.5F});
+            drawText(renderer_, rankLabel.x - 3, rankLabel.y - 4, std::to_string(index + 1), 1, palette.text);
         }
-        std::sort(order.begin(), order.end(), [](const auto& left, const auto& right) { return left.first > right.first; });
-        for (const auto& entry : order) drawPiece3D(entry.second, board_.at(entry.second), palette);
-        drawText(renderer_, 16, 16, "3D BOARD", 2, palette.text);
+        for (int square = 0; square < 64; ++square) {
+            if (legalDestination(square)) drawMarker3D(square, palette);
+        }
+
+        // Painter's algorithm, farthest first. The selection and cursor frames take part in the ordering
+        // so that a piece standing in front of the cursor square hides the frame instead of being covered by it.
+        struct Item {
+            float depth;
+            int kind;  // 0 piece, 1 selection frame, 2 cursor frame
+            int square;
+        };
+        std::vector<Item> order;
+        for (int square = 0; square < 64; ++square) {
+            const Vec3 ground{static_cast<float>(Board::fileOf(square)) - 3.5F, 0.0F, static_cast<float>(Board::rankOf(square)) - 3.5F};
+            const Vec3 body{ground.x, 0.3F, ground.z};
+            if (!board_.at(square).empty()) order.push_back({toCamera(body).z, 0, square});
+            if (square == selected_) order.push_back({toCamera(ground).z + 0.05F, 1, square});
+            if (square == cursor_) order.push_back({toCamera(ground).z + 0.06F, 2, square});
+        }
+        std::sort(order.begin(), order.end(), [](const Item& left, const Item& right) { return left.depth > right.depth; });
+        for (const Item& item : order) {
+            if (item.kind == 0) drawPiece3D(item.square, board_.at(item.square), item.square == selected_);
+            else if (item.kind == 1) drawFrame3D(item.square, selectionColor(item.square, palette), 0.0F);
+            else drawFrame3D(item.square, cursorColor(item.square, palette), cursor_ == selected_ ? 0.13F : 0.0F);
+        }
+        drawText(renderer_, 16, 16, tr(Str::Board3dLabel), 2, palette.text);
     }
+
+    // ------------------------------------------------------------------ panels
 
     std::string stateLabel() const {
         switch (board_.gameState()) {
-            case GameState::Playing: return board_.sideToMove() == Color::White ? "WHITE TO MOVE" : "BLACK TO MOVE";
-            case GameState::WhiteWon: return "CHECKMATE WHITE WINS";
-            case GameState::BlackWon: return "CHECKMATE BLACK WINS";
-            case GameState::DrawStalemate: return "DRAW STALEMATE";
-            case GameState::DrawFiftyMove: return "DRAW FIFTY MOVE";
+            case GameState::Playing: return tr(board_.sideToMove() == Color::White ? Str::StateWhiteMove : Str::StateBlackMove);
+            case GameState::WhiteWon: return tr(Str::StateWhiteWins);
+            case GameState::BlackWon: return tr(Str::StateBlackWins);
+            case GameState::DrawStalemate: return tr(Str::StateStalemate);
+            case GameState::DrawFiftyMove: return tr(Str::StateFifty);
         }
         return "";
     }
 
     void drawSidebar(const Theme& palette) {
         const int x = 450;
+        const int inner = 160;
         fill(renderer_, {x, 16, 178, 448}, palette.panel);
         outline(renderer_, {x, 16, 178, 448}, palette.accent, 1);
-        drawText(renderer_, x + 12, 32, "CHESSFORGE", 3, palette.text);
-        drawText(renderer_, x + 54, 58, "3D", 3, palette.accent);
-        drawText(renderer_, x + 14, 100, stateLabel(), 2, palette.highlight);
-        drawText(renderer_, x + 14, 136, "ELO " + std::to_string(settings_.elo), 3, palette.text);
-        drawText(renderer_, x + 14, 166, computer_.hasStockfish() ? "ENGINE STOCKFISH" : "ENGINE BUILTIN", 2, palette.text);
-        drawText(renderer_, x + 14, 200, settings_.playerWhite ? "YOU WHITE" : "YOU BLACK", 2, palette.text);
-        drawText(renderer_, x + 14, 230, settings_.threeDimensional ? "VIEW 3D" : "VIEW 2D", 2, palette.text);
-        drawText(renderer_, x + 14, 280, "A MOVE", 2, palette.text);
-        drawText(renderer_, x + 14, 304, "B UNDO", 2, palette.text);
-        drawText(renderer_, x + 14, 328, "X 2D 3D", 2, palette.text);
-        drawText(renderer_, x + 14, 352, "Y SETTINGS", 2, palette.text);
-        drawText(renderer_, x + 14, 376, "START NEW", 2, palette.text);
-        drawText(renderer_, x + 14, 400, "Q E CAMERA", 2, palette.text);
-        if (!notice_.empty()) drawText(renderer_, x + 14, 434, notice_, 1, palette.highlight);
+        drawTextFit(renderer_, x + 14, 26, "CHESSFORGE", 3, inner, palette.text);
+        drawText(renderer_, x + 14, 54, "3D", 3, palette.accent);
+        drawTextFit(renderer_, x + 14, 92, stateLabel(), 2, inner, palette.highlight);
+        if (board_.gameState() == GameState::Playing && board_.inCheck(board_.sideToMove())) {
+            drawTextFit(renderer_, x + 14, 112, tr(Str::InCheck), 2, inner, pickContrast(palette.panel, {SDL_Color{255, 112, 92, 255}}));
+        }
+        if (settings_.twoPlayer) {
+            drawTextFit(renderer_, x + 14, 146, tr(Str::TwoPlayers), 2, inner, palette.text);
+        } else {
+            drawText(renderer_, x + 14, 140, "ELO " + std::to_string(settings_.elo), 3, palette.text);
+            drawTextFit(renderer_, x + 14, 170, tr(computer_.hasStockfish() ? Str::EngineStockfish : Str::EngineBuiltin), 2, inner, palette.text);
+            drawTextFit(renderer_, x + 14, 196, tr(settings_.playerWhite ? Str::YouWhite : Str::YouBlack), 2, inner, palette.text);
+        }
+        drawTextFit(renderer_, x + 14, 226, tr(settings_.threeDimensional ? Str::View3d : Str::View2d), 2, inner, palette.text);
+        const std::array<std::string, 7> hints{{
+            hint(Action::Confirm, Str::HintMove),
+            hint(Action::Back, Str::HintUndo),
+            hint(Action::ToggleView, Str::HintView),
+            hint(Action::Settings, Str::HintSettings),
+            hint(Action::NewGame, Str::HintNewShort),
+            input_.label(Action::CamLeft) + " " + input_.label(Action::CamRight) + " " + tr(Str::HintCamera),
+            hint(Action::Help, Str::HintHelp),
+        }};
+        for (std::size_t index = 0; index < hints.size(); ++index) {
+            drawTextFit(renderer_, x + 14, 262 + static_cast<int>(index) * 24, hints[index], 2, inner, palette.text);
+        }
+        if (!notice_.empty()) drawTextFit(renderer_, x + 14, 436, notice_, 1, inner, palette.highlight);
+    }
+
+    std::string rowLabel(Row row) const {
+        switch (row) {
+            case Row::Language: return tr(Str::SLanguage);
+            case Row::Mode: return tr(Str::SMode);
+            case Row::Elo: return tr(Str::SElo);
+            case Row::Side: return tr(Str::SSide);
+            case Row::Flip: return tr(Str::SFlip);
+            case Row::Theme: return tr(Str::STheme);
+            case Row::Texture: return tr(Str::STexture);
+            case Row::Camera: return tr(Str::SCamera);
+            case Row::Pieces: return tr(Str::SPieces);
+            case Row::Light: return tr(Str::SLight);
+            case Row::Dark: return tr(Str::SDark);
+            case Row::Accent: return tr(Str::SAccent);
+            case Row::Background: return tr(Str::SBack);
+            case Row::Controls: return tr(Str::SControls);
+        }
+        return {};
+    }
+
+    std::string rowValue(Row row) const {
+        const auto rgb = [](SDL_Color color) { return std::to_string(color.r) + " " + std::to_string(color.g) + " " + std::to_string(color.b); };
+        const std::array<Str, 5> themeNames{{Str::VOak, Str::VViolet, Str::VForest, Str::VMono, Str::VCustom}};
+        const std::array<const char*, 4> lichessNames{{"BROWN", "BLUE", "GREEN", "PURPLE"}};
+        const std::array<Str, 5> textureNames{{Str::VFlat, Str::VWood, Str::VMarble, Str::VCarbon, Str::VFelt}};
+        switch (row) {
+            case Row::Language: return chessforge::languageName(settings_.language);
+            case Row::Mode: return tr(settings_.twoPlayer ? Str::TwoPlayers : Str::VVsComputer);
+            case Row::Elo: return std::to_string(settings_.elo);
+            case Row::Side: return tr(settings_.playerWhite ? Str::VWhite : Str::VBlack);
+            case Row::Flip: return tr(settings_.autoFlip ? Str::VAutoFlip : Str::VFixed);
+            case Row::Theme:
+                if (settings_.theme <= CustomTheme) return tr(themeNames[static_cast<std::size_t>(settings_.theme)]);
+                return std::string("LICHESS ") + lichessNames[static_cast<std::size_t>(settings_.theme - CustomTheme - 1)];
+            case Row::Texture: return tr(textureNames[static_cast<std::size_t>(settings_.texture)]);
+            case Row::Camera: return std::to_string(static_cast<int>(settings_.pitch * 100.0F));
+            case Row::Pieces: return settings_.pieceSet.empty() ? std::string(tr(Str::VBuiltin)) : settings_.pieceSet;
+            case Row::Light: return rgb(settings_.customLight);
+            case Row::Dark: return rgb(settings_.customDark);
+            case Row::Accent: return rgb(settings_.customAccent);
+            case Row::Background: return rgb(settings_.customBackground);
+            case Row::Controls: return ">";
+        }
+        return {};
+    }
+
+    // Small triangle used as "more rows above / below" marker.
+    void drawArrow(int centreX, int y, bool up, SDL_Color color) {
+        setColor(renderer_, color);
+        for (int line = 0; line < 5; ++line) {
+            const int half = up ? line : 4 - line;
+            SDL_RenderDrawLine(renderer_, centreX - half, y + line, centreX + half, y + line);
+        }
+    }
+
+    // Keeps the selected row inside the window of visible rows.
+    static int scrollTop(int selected, int count, int visible) {
+        if (count <= visible) return 0;
+        return std::clamp(selected - visible / 2, 0, count - visible);
     }
 
     void drawSettings(const Theme& palette) {
         fill(renderer_, {50, 42, 540, 402}, darken(palette.panel, 4));
         outline(renderer_, {50, 42, 540, 402}, palette.accent, 3);
-        drawText(renderer_, 76, 60, "SETTINGS", 3, palette.text);
+        drawTextFit(renderer_, 76, 60, tr(Str::Settings), 3, 400, palette.text);
         if (colorEdit_ >= 0) {
             const SDL_Color edited = colorEdit_ == 0 ? settings_.customLight : colorEdit_ == 1 ? settings_.customDark : colorEdit_ == 2 ? settings_.customAccent : settings_.customBackground;
-            const std::array<std::string, 4> names{{"LIGHT SQUARE", "DARK SQUARE", "ACCENT", "BACKGROUND"}};
+            const std::array<Str, 4> names{{Str::ELight, Str::EDark, Str::EAccent, Str::EBackground}};
             fill(renderer_, {110, 134, 420, 220}, palette.background);
             outline(renderer_, {110, 134, 420, 220}, palette.highlight, 2);
-            drawText(renderer_, 138, 158, "EDIT " + names[static_cast<std::size_t>(colorEdit_)], 2, palette.text);
-            const std::array<std::string, 3> channels{{"RED", "GREEN", "BLUE"}};
+            drawTextFit(renderer_, 138, 158, std::string(tr(Str::EEdit)) + " " + tr(names[static_cast<std::size_t>(colorEdit_)]), 2, 364, palette.text);
+            const std::array<Str, 3> channels{{Str::ERed, Str::EGreen, Str::EBlue}};
             const std::array<int, 3> values{{edited.r, edited.g, edited.b}};
             for (int index = 0; index < 3; ++index) {
                 const int y = 204 + index * 34;
-                if (index == colorChannel_) fill(renderer_, {132, y - 4, 240, 25}, palette.accent);
-                drawText(renderer_, 146, y, channels[static_cast<std::size_t>(index)], 2, index == colorChannel_ ? palette.background : palette.text);
-                drawText(renderer_, 310, y, std::to_string(values[static_cast<std::size_t>(index)]), 2, index == colorChannel_ ? palette.background : palette.highlight);
+                const bool active = index == colorChannel_;
+                if (active) fill(renderer_, {132, y - 4, 240, 25}, palette.accent);
+                drawTextFit(renderer_, 146, y, tr(channels[static_cast<std::size_t>(index)]), 2, 150, active ? palette.background : palette.text);
+                drawText(renderer_, 310, y, std::to_string(values[static_cast<std::size_t>(index)]), 2, active ? palette.background : palette.highlight);
             }
             fill(renderer_, {405, 202, 88, 88}, edited);
             outline(renderer_, {405, 202, 88, 88}, palette.text, 2);
-            drawText(renderer_, 140, 318, "UP DOWN CHANNEL LEFT RIGHT VALUE", 1, palette.text);
-            drawText(renderer_, 140, 336, "A SAVES", 1, palette.highlight);
+            drawTextFit(renderer_, 128, 318, tr(Str::EHelp), 1, 388, palette.text);
+            drawTextFit(renderer_, 128, 336, input_.label(Action::Confirm) + ": " + tr(Str::ESave), 1, 388, palette.highlight);
             return;
         }
-        const std::array<std::string, 10> labels{{"THEME", "TEXTURE", "BOT ELO", "YOUR SIDE", "CAMERA", "PIECES", "LIGHT RGB", "DARK RGB", "ACCENT RGB", "BACK RGB"}};
-        const std::array<std::string, 5> themeNames{{"OAK", "VIOLET", "FOREST", "MONO", "CUSTOM"}};
-        const std::array<std::string, 5> textureNames{{"FLAT", "WOOD", "MARBLE", "CARBON", "FELT"}};
-        const auto rgb = [](SDL_Color color) { return std::to_string(color.r) + " " + std::to_string(color.g) + " " + std::to_string(color.b); };
-        const std::array<std::string, 10> values{{
-            themeNames[static_cast<std::size_t>(settings_.theme)], textureNames[static_cast<std::size_t>(settings_.texture)],
-            std::to_string(settings_.elo), settings_.playerWhite ? "WHITE" : "BLACK", std::to_string(static_cast<int>(settings_.pitch * 100.0F)),
-            settings_.pieceSet.empty() ? std::string("BUILT-IN") : settings_.pieceSet,
-            rgb(settings_.customLight), rgb(settings_.customDark), rgb(settings_.customAccent), rgb(settings_.customBackground)
-        }};
-        for (int index = 0; index < 10; ++index) {
-            const int y = 104 + index * 28;
-            if (index == settingIndex_) fill(renderer_, {68, y - 4, 504, 24}, palette.accent);
-            drawText(renderer_, 82, y, labels[static_cast<std::size_t>(index)], 2, index == settingIndex_ ? palette.background : palette.text);
-            const int valueX = 550 - textWidth(values[static_cast<std::size_t>(index)], 2);
-            drawText(renderer_, valueX, y, values[static_cast<std::size_t>(index)], 2, index == settingIndex_ ? palette.background : palette.highlight);
+        const std::vector<Row> rows = settingRows();
+        const int count = static_cast<int>(rows.size());
+        const int selected = std::clamp(settingIndex_, 0, count - 1);
+        const int top = scrollTop(selected, count, SettingsVisibleRows);
+        for (int slot = 0; slot < std::min(count, SettingsVisibleRows); ++slot) {
+            const int index = top + slot;
+            const Row row = rows[static_cast<std::size_t>(index)];
+            const int y = 104 + slot * 28;
+            const bool active = index == selected;
+            if (active) fill(renderer_, {68, y - 4, 504, 24}, palette.accent);
+            const SDL_Color labelColor = active ? palette.background : palette.text;
+            const SDL_Color valueColor = active ? palette.background : palette.highlight;
+            const std::string label = rowLabel(row);
+            const int labelScale = fitScale(label, 2, 230);
+            drawText(renderer_, 82, y + (2 - labelScale) * 7 / 2, label, labelScale, labelColor);
+            const int room = 550 - 82 - textWidth(label, labelScale) - 14;
+            drawTextRight(renderer_, 550, y, rowValue(row), 2, std::max(60, room), valueColor);
         }
-        drawText(renderer_, 74, 392, "LEFT RIGHT CHANGE A EDITS RGB", 1, palette.text);
-        drawText(renderer_, 74, 410, "PIECE SETS: FOLDER PIECES/NAME", 1, palette.text);
-        drawText(renderer_, 74, 428, "B CLOSES AND SAVES", 1, palette.highlight);
+        if (top > 0) drawArrow(562, 90, true, palette.highlight);
+        if (top + SettingsVisibleRows < count) drawArrow(562, 352, false, palette.highlight);
+        drawTextFit(renderer_, 74, 366, tr(Str::FChange), 1, 480, palette.text);
+        drawTextFit(renderer_, 74, 382, input_.label(Action::Confirm) + ": " + tr(Str::FConfirm), 1, 480, palette.text);
+        drawTextFit(renderer_, 74, 398, tr(Str::FPieceFolder), 1, 480, palette.text);
+        drawTextFit(renderer_, 74, 414, input_.label(Action::Back) + ": " + tr(Str::FBack), 1, 480, palette.highlight);
+    }
+
+    void drawControls(const Theme& palette) {
+        fill(renderer_, {40, 36, 560, 414}, darken(palette.panel, 8));
+        outline(renderer_, {40, 36, 560, 414}, palette.highlight, 3);
+        drawTextFit(renderer_, 66, 52, tr(Str::SControls), 3, 440, palette.text);
+        constexpr int Rows = ActionRows + 1;
+        const int top = scrollTop(controlsIndex_, Rows, SettingsVisibleRows);
+        for (int slot = 0; slot < SettingsVisibleRows; ++slot) {
+            const int index = top + slot;
+            const int y = 96 + slot * 30;
+            const bool active = index == controlsIndex_;
+            if (active) fill(renderer_, {58, y - 5, 524, 26}, palette.accent);
+            const SDL_Color nameColor = active ? palette.background : palette.text;
+            const SDL_Color valueColor = active ? palette.background : palette.highlight;
+            if (index == ActionRows) {
+                drawTextFit(renderer_, 70, y, tr(Str::CReset), 2, 500, nameColor);
+            } else {
+                const Action action = static_cast<Action>(index);
+                drawTextFit(renderer_, 70, y, actionName(action), 2, 300, nameColor);
+                drawTextRight(renderer_, 572, y, input_.label(action), 2, 200, valueColor);
+            }
+        }
+        if (top > 0) drawArrow(570, 84, true, palette.highlight);
+        if (top + SettingsVisibleRows < Rows) drawArrow(570, 372, false, palette.highlight);
+        drawTextFit(renderer_, 66, 392, tr(Str::CFoot1), 1, 510, palette.text);
+        drawTextFit(renderer_, 66, 408, tr(Str::CFoot2), 1, 510, palette.text);
+        drawTextFit(renderer_, 66, 424, input_.label(Action::Back) + ": " + tr(Str::FBack), 1, 510, palette.highlight);
+        if (captureAction_ >= 0) {
+            fill(renderer_, {100, 150, 440, 170}, palette.background);
+            outline(renderer_, {100, 150, 440, 170}, palette.highlight, 3);
+            drawTextFit(renderer_, 120, 172, tr(Str::CPress), 2, 400, palette.text);
+            drawTextFit(renderer_, 120, 204, actionName(static_cast<Action>(captureAction_)), 3, 400, palette.highlight);
+            const Uint32 now = SDL_GetTicks();
+            const int seconds = now >= captureDeadline_ ? 0 : static_cast<int>((captureDeadline_ - now + 999U) / 1000U);
+            drawTextFit(renderer_, 120, 266, std::string(tr(Str::CWait)) + " " + std::to_string(seconds), 2, 400, palette.text);
+            const int barWidth = 400 * seconds / (CaptureTimeoutMs / 1000);
+            fill(renderer_, {120, 292, std::max(0, barWidth), 8}, palette.accent);
+        }
     }
 
     void drawHelp(const Theme& palette) {
         fill(renderer_, {48, 70, 544, 330}, darken(palette.panel, 4));
         outline(renderer_, {48, 70, 544, 330}, palette.highlight, 3);
-        drawText(renderer_, 74, 94, "CONTROLS", 4, palette.text);
-        drawText(renderer_, 74, 148, "DPAD MOVE CURSOR", 2, palette.text);
-        drawText(renderer_, 74, 178, "A SELECT OR MOVE", 2, palette.text);
-        drawText(renderer_, 74, 208, "B UNDO OR CANCEL", 2, palette.text);
-        drawText(renderer_, 74, 238, "X TOGGLE 2D 3D", 2, palette.text);
-        drawText(renderer_, 74, 268, "Y SETTINGS  START NEW GAME", 2, palette.text);
-        drawText(renderer_, 74, 298, "Q E ROTATE 3D CAMERA", 2, palette.text);
-        drawText(renderer_, 74, 348, "H CLOSE HELP", 2, palette.highlight);
+        drawTextFit(renderer_, 74, 88, tr(Str::SControls), 4, 480, palette.text);
+        const std::array<std::pair<std::string, std::string>, 8> lines{{
+            {directionLabel(), tr(Str::HelpCursor)},
+            {input_.label(Action::Confirm), tr(Str::AConfirm)},
+            {input_.label(Action::Back), tr(Str::ABack)},
+            {input_.label(Action::ToggleView), tr(Str::AView)},
+            {input_.label(Action::Settings), tr(Str::HintSettings)},
+            {input_.label(Action::NewGame), tr(Str::HintNew)},
+            {input_.label(Action::CamLeft) + " " + input_.label(Action::CamRight), tr(Str::HintCamera)},
+            {input_.label(Action::Quit), tr(Str::AQuit)},
+        }};
+        for (std::size_t index = 0; index < lines.size(); ++index) {
+            const int y = 134 + static_cast<int>(index) * 25;
+            drawTextFit(renderer_, 74, y, lines[index].first, 2, 170, palette.highlight);
+            drawTextFit(renderer_, 256, y, lines[index].second, 2, 320, palette.text);
+        }
+        drawTextFit(renderer_, 74, 350, input_.label(Action::Help) + ": " + tr(Str::HelpClose), 2, 480, palette.highlight);
     }
 };
 
 // ---------------------------------------------------------------------------
-// Gamepad -> keyboard bridge. The game logic only understands keys, so every
-// controller/joystick event is translated into the same key presses.
+// Gamepad / joystick -> numbered buttons (see padid in input_map.hpp). What a button does is decided
+// by the InputMap, so every button can be reassigned in Settings -> Controls.
 // ---------------------------------------------------------------------------
 class GamepadInput {
 public:
-    using KeySink = std::function<void(SDL_Keycode)>;
+    using Sink = std::function<void(int id, bool down, bool repeat)>;
 
-    explicit GamepadInput(KeySink sink) : sink_(std::move(sink)) {
-        loadConfig();
+    GamepadInput(const InputMap& map, Sink sink) : map_(map), sink_(std::move(sink)) {
         debug_ = std::filesystem::exists("saves/input_debug");
     }
 
@@ -1049,74 +1717,49 @@ public:
             case SDL_CONTROLLERDEVICEADDED: openDevice(e.cdevice.which); break;
             case SDL_JOYDEVICEADDED: openDevice(e.jdevice.which); break;
             case SDL_CONTROLLERBUTTONDOWN:
-            case SDL_CONTROLLERBUTTONUP: controllerButton(e.cbutton.button, e.type == SDL_CONTROLLERBUTTONDOWN); break;
-            case SDL_CONTROLLERAXISMOTION: controllerAxis(e.caxis.axis, e.caxis.value); break;
+            case SDL_CONTROLLERBUTTONUP:
+                press(chessforge::padid::controller(e.cbutton.button), e.type == SDL_CONTROLLERBUTTONDOWN);
+                break;
+            case SDL_CONTROLLERAXISMOTION: axis(e.caxis.axis, e.caxis.value); break;
             case SDL_JOYBUTTONDOWN:
             case SDL_JOYBUTTONUP:
-                if (!isController(e.jbutton.which)) joyButton(e.jbutton.button, e.type == SDL_JOYBUTTONDOWN);
+                if (!isController(e.jbutton.which)) press(chessforge::padid::joystick(e.jbutton.button), e.type == SDL_JOYBUTTONDOWN);
                 break;
             case SDL_JOYHATMOTION:
                 if (!isController(e.jhat.which)) hat(e.jhat.value);
                 break;
             case SDL_JOYAXISMOTION:
-                if (!isController(e.jaxis.which)) joyAxis(e.jaxis.axis, e.jaxis.value);
+                if (!isController(e.jaxis.which)) axis(e.jaxis.axis, e.jaxis.value);
                 break;
             default: break;
         }
     }
 
-    // Call once per frame: key repeat for a held D-pad direction.
+    // Call once per frame: key repeat for a held direction.
     void update() {
+        if (repeatId_ < 0) return;
         const Uint32 now = SDL_GetTicks();
-        for (int d = 0; d < 4; ++d) {
-            if (!dir_[d]) continue;
-            if (now >= nextRepeat_) {
-                sink_(DirKeys[d]);
-                nextRepeat_ = now + 90;
-            }
-            return;
+        if (now >= nextRepeat_) {
+            sink_(repeatId_, true, true);
+            nextRepeat_ = now + 90;
         }
     }
 
 private:
-    static constexpr SDL_Keycode DirKeys[4] = {SDLK_UP, SDLK_DOWN, SDLK_LEFT, SDLK_RIGHT};
-
-    KeySink sink_;
+    const InputMap& map_;
+    Sink sink_;
     std::vector<SDL_GameController*> controllers_;
     std::vector<SDL_Joystick*> joysticks_;
-    bool dir_[4] = {false, false, false, false};
+    std::array<bool, 32> axisState_{};  // [axis * 2 + positive]
+    Uint8 hatState_ = 0;
+    int repeatId_ = -1;
     Uint32 nextRepeat_ = 0;
     bool debug_ = false;
-    bool nintendo_ = true;  // physical A/B and X/Y are swapped relative to SDL names
-    // Raw joystick button indices (used only when SDL has no controller mapping).
-    int btnA_ = 0, btnB_ = 1, btnX_ = 2, btnY_ = 3, btnL_ = 4, btnR_ = 5, btnSelect_ = 8, btnStart_ = 9, btnMenu_ = 10;
 
     void log(const std::string& line) const {
         if (!debug_) return;
         std::filesystem::create_directories("saves");
         std::ofstream("saves/input.log", std::ios::app) << line << '\n';
-    }
-
-    void loadConfig() {
-        std::ifstream input("saves/input.cfg");
-        std::string key;
-        std::string value;
-        while (std::getline(input, key, '=') && std::getline(input, value)) {
-            try {
-                const int v = std::stoi(value);
-                if (key == "nintendo_layout") nintendo_ = v != 0;
-                else if (key == "btn_a") btnA_ = v;
-                else if (key == "btn_b") btnB_ = v;
-                else if (key == "btn_x") btnX_ = v;
-                else if (key == "btn_y") btnY_ = v;
-                else if (key == "btn_l") btnL_ = v;
-                else if (key == "btn_r") btnR_ = v;
-                else if (key == "btn_select") btnSelect_ = v;
-                else if (key == "btn_start") btnStart_ = v;
-                else if (key == "btn_menu") btnMenu_ = v;
-            } catch (const std::exception&) {
-            }
-        }
     }
 
     bool isController(SDL_JoystickID id) const { return SDL_GameControllerFromInstanceID(id) != nullptr; }
@@ -1133,77 +1776,45 @@ private:
         }
     }
 
-    void setDir(int d, bool down) {
-        if (down && !dir_[d]) {
-            sink_(DirKeys[d]);
-            nextRepeat_ = SDL_GetTicks() + 350;
+    void press(int id, bool down) {
+        log("button id " + std::to_string(id) + (down ? " down" : " up"));
+        sink_(id, down, false);
+        if (down) {
+            const auto action = map_.lookup(id);
+            if (action && InputMap::isDirection(*action)) {
+                repeatId_ = id;
+                nextRepeat_ = SDL_GetTicks() + 350;
+            }
+        } else if (id == repeatId_) {
+            repeatId_ = -1;
         }
-        dir_[d] = down;
     }
 
-    void action(SDL_Keycode key, bool down) {
-        if (down) sink_(key);
-    }
-
-    void quit() const {
-        SDL_Event q{};
-        q.type = SDL_QUIT;
-        SDL_PushEvent(&q);
-    }
-
-    void hat(Uint8 v) {
-        setDir(0, (v & SDL_HAT_UP) != 0);
-        setDir(1, (v & SDL_HAT_DOWN) != 0);
-        setDir(2, (v & SDL_HAT_LEFT) != 0);
-        setDir(3, (v & SDL_HAT_RIGHT) != 0);
-        log("hat " + std::to_string(v));
-    }
-
-    void joyAxis(Uint8 axis, Sint16 value) {
-        log("axis " + std::to_string(axis) + " " + std::to_string(value));
+    void axis(Uint8 index, Sint16 value) {
         constexpr Sint16 Dead = 16000;
-        if (axis == 0) { setDir(2, value < -Dead); setDir(3, value > Dead); }
-        if (axis == 1) { setDir(0, value < -Dead); setDir(1, value > Dead); }
-    }
-
-    void controllerAxis(Uint8 axis, Sint16 value) {
-        if (axis == SDL_CONTROLLER_AXIS_LEFTX) joyAxis(0, value);
-        if (axis == SDL_CONTROLLER_AXIS_LEFTY) joyAxis(1, value);
-    }
-
-    void controllerButton(Uint8 b, bool down) {
-        log("ctrl button " + std::to_string(b) + (down ? " down" : " up"));
-        const bool n = nintendo_;
-        switch (b) {
-            case SDL_CONTROLLER_BUTTON_DPAD_UP: setDir(0, down); break;
-            case SDL_CONTROLLER_BUTTON_DPAD_DOWN: setDir(1, down); break;
-            case SDL_CONTROLLER_BUTTON_DPAD_LEFT: setDir(2, down); break;
-            case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: setDir(3, down); break;
-            case SDL_CONTROLLER_BUTTON_A: action(n ? SDLK_b : SDLK_a, down); break;
-            case SDL_CONTROLLER_BUTTON_B: action(n ? SDLK_a : SDLK_b, down); break;
-            case SDL_CONTROLLER_BUTTON_X: action(n ? SDLK_y : SDLK_x, down); break;
-            case SDL_CONTROLLER_BUTTON_Y: action(n ? SDLK_x : SDLK_y, down); break;
-            case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: action(SDLK_q, down); break;
-            case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: action(SDLK_e, down); break;
-            case SDL_CONTROLLER_BUTTON_BACK: action(SDLK_h, down); break;
-            case SDL_CONTROLLER_BUTTON_START: action(SDLK_n, down); break;
-            case SDL_CONTROLLER_BUTTON_GUIDE: if (down) quit(); break;
-            default: break;
+        if (index >= 16) return;
+        const std::size_t slot = static_cast<std::size_t>(index) * 2U;
+        const bool negative = value < -Dead;
+        const bool positive = value > Dead;
+        if (negative != axisState_[slot]) {
+            axisState_[slot] = negative;
+            press(chessforge::padid::axis(index, false), negative);
+        }
+        if (positive != axisState_[slot + 1]) {
+            axisState_[slot + 1] = positive;
+            press(chessforge::padid::axis(index, true), positive);
         }
     }
 
-    void joyButton(Uint8 b, bool down) {
-        log("joy button " + std::to_string(b) + (down ? " down" : " up"));
-        const int i = b;
-        if (i == btnA_) action(SDLK_a, down);
-        else if (i == btnB_) action(SDLK_b, down);
-        else if (i == btnX_) action(SDLK_x, down);
-        else if (i == btnY_) action(SDLK_y, down);
-        else if (i == btnL_) action(SDLK_q, down);
-        else if (i == btnR_) action(SDLK_e, down);
-        else if (i == btnSelect_) action(SDLK_h, down);
-        else if (i == btnStart_) action(SDLK_n, down);
-        else if (i == btnMenu_ && down) quit();
+    void hat(Uint8 value) {
+        struct Direction { Uint8 mask; int offset; };
+        constexpr std::array<Direction, 4> directions{{{SDL_HAT_UP, 0}, {SDL_HAT_DOWN, 1}, {SDL_HAT_LEFT, 2}, {SDL_HAT_RIGHT, 3}}};
+        for (const Direction& direction : directions) {
+            const bool now = (value & direction.mask) != 0;
+            const bool before = (hatState_ & direction.mask) != 0;
+            if (now != before) press(chessforge::padid::Hat + direction.offset, now);
+        }
+        hatState_ = value;
     }
 };
 
@@ -1222,15 +1833,14 @@ int main(int, char**) {
     SDL_RenderSetLogicalSize(renderer, ScreenWidth, ScreenHeight);
 
     {
-        ChessApp app(renderer);
-        GamepadInput pad([&app](SDL_Keycode key) {
-            SDL_Event e{};
-            e.type = SDL_KEYDOWN;
-            e.key.state = SDL_PRESSED;
-            e.key.repeat = 0;
-            e.key.keysym.sym = key;
-            app.handleEvent(e);
-        });
+        // Button layout of the device (saves/input.cfg) and the player's own assignments (saves/controls.cfg).
+        chessforge::PadLayout layout;
+        layout.loadFile("saves/input.cfg");
+        InputMap input(layout);
+        input.load("saves/controls.cfg");
+
+        ChessApp app(renderer, input);
+        GamepadInput pad(input, [&app](int id, bool down, bool repeat) { app.onPad(id, down, repeat); });
         pad.openAll();
         while (app.running()) {
             SDL_Event event;
@@ -1239,6 +1849,7 @@ int main(int, char**) {
                 app.handleEvent(event);
             }
             pad.update();
+            app.tick();
             app.draw();
             SDL_RenderPresent(renderer);
             SDL_Delay(16);
